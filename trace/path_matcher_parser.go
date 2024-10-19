@@ -23,6 +23,9 @@ import (
 )
 
 type parseOptions struct {
+	// The string that separates an (optional) category path specifier from a
+	// subsequent span specifier.
+	categorySeparator string
 	// The string that separates individual path element matcher strings within a
 	// single path.
 	matcherSeparator string
@@ -59,8 +62,9 @@ type PathMatcherParser[T any, CP, SP, DP fmt.Stringer] struct {
 // provided set of options.
 func NewPathMatcherParser[T any, CP, SP, DP fmt.Stringer](opts ...ParseOption) (*PathMatcherParser[T, CP, SP, DP], error) {
 	po := &parseOptions{
-		matcherSeparator: "/",
-		pathSeparator:    ",",
+		categorySeparator: ">",
+		matcherSeparator:  "/",
+		pathSeparator:     ",",
 	}
 	for _, opt := range opts {
 		if err := opt(po); err != nil {
@@ -123,6 +127,7 @@ func reduceEscapes(str string) string {
 func (pp *PathMatcherParser[T, CP, SP, DP]) ParsePathMatcherStr(
 	pathMatcherStr string,
 ) ([]PathElementMatcher[T, CP, SP, DP], error) {
+	pathMatcherStr = strings.TrimSpace(pathMatcherStr)
 	// Split the path by unescaped instances of the separator.
 	pathMatcherStrs := splitOnUnescapedSeparator(pathMatcherStr, pp.po.matcherSeparator)
 	ret := make([]PathElementMatcher[T, CP, SP, DP], len(pathMatcherStrs))
@@ -132,7 +137,7 @@ func (pp *PathMatcherParser[T, CP, SP, DP]) ParsePathMatcherStr(
 			ret[idx] = &star[T, CP, SP, DP]{}
 		case pathMatcherStr == "**":
 			ret[idx] = &globstar[T, CP, SP, DP]{}
-		case pathMatcherStr[0] == '(' && pathMatcherStr[len(pathMatcherStr)-1] == ')':
+		case len(pathMatcherStr) > 0 && pathMatcherStr[0] == '(' && pathMatcherStr[len(pathMatcherStr)-1] == ')':
 			re, err := regexp.Compile(pathMatcherStr[1 : len(pathMatcherStr)-1])
 			if err != nil {
 				return nil, err
@@ -153,6 +158,7 @@ func (pp *PathMatcherParser[T, CP, SP, DP]) ParsePathMatcherStr(
 func (pp *PathMatcherParser[T, CP, SP, DP]) ParsePathMatchersStr(
 	pathMatchersStr string,
 ) ([][]PathElementMatcher[T, CP, SP, DP], error) {
+	pathMatchersStr = strings.TrimSpace(pathMatchersStr)
 	// Split the path by unescaped instances of the separator.
 	pathMatchersStrs := splitOnUnescapedSeparator(pathMatchersStr, pp.po.pathSeparator)
 	ret := make([][]PathElementMatcher[T, CP, SP, DP], len(pathMatchersStr))
@@ -164,4 +170,88 @@ func (pp *PathMatcherParser[T, CP, SP, DP]) ParsePathMatchersStr(
 		ret[idx] = pms
 	}
 	return ret, nil
+}
+
+// ParseSpanFinderStr parses the provided span finder string, which may specify
+// both a set of category matchers as well as a set of span matchers, returning
+// a SpanFinder that can be used to find matching spans in specific traces.  It
+// uses the provided namer, and interpreting category matchers per the
+// specified hierarchy type.
+func (pp *PathMatcherParser[T, CP, SP, DP]) ParseSpanFinderStr(
+	namer Namer[T, CP, SP, DP],
+	hierarchyType HierarchyType,
+	spanFinderStr string,
+) (*SpanFinder[T, CP, SP, DP], error) {
+	spanFinderStr = strings.TrimSpace(spanFinderStr)
+	parts := splitOnUnescapedSeparator(spanFinderStr, pp.po.categorySeparator)
+	var spanMatchers, categoryMatchers [][]PathElementMatcher[T, CP, SP, DP]
+	var err error
+	switch len(parts) {
+	case 1:
+		spanMatchers, err = pp.ParsePathMatchersStr(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse span matchers: %s", err)
+		}
+	case 2:
+		categoryMatchers, err = pp.ParsePathMatchersStr(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse category matchers: %s", err)
+		}
+		spanMatchers, err = pp.ParsePathMatchersStr(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse span matchers: %s", err)
+		}
+	case 0:
+		return nil, fmt.Errorf("failed to parse span finder string '%s'", spanFinderStr)
+	default:
+		return nil, fmt.Errorf("failed to parse span finder string: at most one category separator ('%s') must be specified", pp.po.categorySeparator)
+	}
+	if len(spanMatchers) == 0 {
+		return nil, fmt.Errorf("span finder string matches no spans")
+	}
+	ret := NewSpanFinder(namer).WithSpanMatchers(spanMatchers...)
+	if len(categoryMatchers) > 0 && hierarchyType != SpanOnlyHierarchyType {
+		ret.WithCategoryMatchers(hierarchyType, categoryMatchers...)
+	}
+	return ret, nil
+}
+
+var (
+	tracePositionRE = regexp.MustCompile(
+		`(?P<span_finder>.+?)\s*((?i:AT)|\@)\s*(?P<percentage>[+-]?([0-9]*[.])?[0-9]+)%`,
+	)
+)
+
+// ParseTracePositionStr parses the provided trace position string, which
+// includes both a span finder string and a percentage through matching spans,
+// returning a Position object.
+func (pp *PathMatcherParser[T, CP, SP, DP]) ParseTracePositionStr(
+	namer Namer[T, CP, SP, DP],
+	hierarchyType HierarchyType,
+	tracePositionStr string,
+) (*Position[T, CP, SP, DP], error) {
+	tracePositionStr = strings.TrimSpace(tracePositionStr)
+	matches := tracePositionRE.FindStringSubmatch(tracePositionStr)
+	matchNames := tracePositionRE.SubexpNames()
+	if len(matches) != len(matchNames) {
+		return nil, fmt.Errorf("failed to parse position string")
+	}
+	m := map[string]string{}
+	for idx, name := range matchNames {
+		m[name] = matches[idx]
+	}
+	sf, err := pp.ParseSpanFinderStr(namer, hierarchyType, m["span_finder"])
+	if err != nil {
+		return nil, err
+	}
+	var percentage float64
+	n, err := fmt.Sscanf(m["percentage"], "%f", &percentage)
+	if n == 0 {
+		return nil, fmt.Errorf("failed to parse percentage '%s' as float", m["percentage"])
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse percentage '%s' as float: %s", m["percentage"], err)
+	}
+	percentage = percentage / 100.0
+	return NewPosition(sf, percentage), nil
 }

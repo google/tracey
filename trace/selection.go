@@ -44,19 +44,18 @@ func allSpans[T any, CP, SP, DP fmt.Stringer](
 // to generate the returned SpanSelection from the provided Trace.
 func SelectSpans[T any, CP, SP, DP fmt.Stringer](
 	t Trace[T, CP, SP, DP],
-	namer Namer[T, CP, SP, DP],
-	matchers [][]PathElementMatcher[T, CP, SP, DP],
+	spanFinder *SpanFinder[T, CP, SP, DP],
 ) *SpanSelection[T, CP, SP, DP] {
 	ret := &SpanSelection[T, CP, SP, DP]{
 		t: t,
 	}
-	spans := FindSpans(t, namer, matchers)
-	if len(matchers) > 0 {
+	if spanFinder != nil {
+		spans := spanFinder.Find(t)
 		ret.selectedSpans = make(map[Span[T, CP, SP, DP]]struct{}, len(spans))
-	}
-	if len(spans) > 0 {
-		for _, span := range spans {
-			ret.selectedSpans[span] = struct{}{}
+		if len(spans) > 0 {
+			for _, span := range spans {
+				ret.selectedSpans[span] = struct{}{}
+			}
 		}
 	}
 	return ret
@@ -166,13 +165,12 @@ func (cs *CategorySelection[T, CP, SP, DP]) Categories(ht HierarchyType) []Categ
 // Namer to generate the returned DependencySelection from the provided Trace.
 func SelectDependencies[T any, CP, SP, DP fmt.Stringer](
 	t Trace[T, CP, SP, DP],
-	namer Namer[T, CP, SP, DP],
-	originSpanMatchers, destinationSpanMatchers [][]PathElementMatcher[T, CP, SP, DP],
+	originSpanFinder, destinationSpanFinder *SpanFinder[T, CP, SP, DP],
 	matchingDependencyTypes ...DependencyType,
 ) *DependencySelection[T, CP, SP, DP] {
 	ret := &DependencySelection[T, CP, SP, DP]{
-		OriginSelection:      SelectSpans(t, namer, originSpanMatchers),
-		DestinationSelection: SelectSpans(t, namer, destinationSpanMatchers),
+		OriginSelection:      SelectSpans(t, originSpanFinder),
+		DestinationSelection: SelectSpans(t, destinationSpanFinder),
 	}
 	if len(matchingDependencyTypes) == 0 {
 		matchingDependencyTypes = t.DependencyTypes()

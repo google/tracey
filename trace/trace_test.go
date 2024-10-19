@@ -94,12 +94,20 @@ func (tn *testNamer) SpanUniqueID(span Span[time.Duration, payload, payload, pay
 	return "id:" + span.Payload().String()
 }
 
-func (tn *testNamer) HierarchyTypeName(ht HierarchyType) string {
-	return fmt.Sprintf("hierarchy %d", ht)
+func (tn *testNamer) HierarchyTypeNames() map[HierarchyType]string {
+	ret := map[HierarchyType]string{}
+	for i := 0; i < 10; i++ {
+		ret[HierarchyType(i)] = fmt.Sprintf("hierarchy %d", i)
+	}
+	return ret
 }
 
-func (tn *testNamer) DependencyTypeName(dt DependencyType) string {
-	return fmt.Sprintf("dependency %d", dt)
+func (tn *testNamer) DependencyTypeNames() map[DependencyType]string {
+	ret := map[DependencyType]string{}
+	for i := 0; i < 10; i++ {
+		ret[DependencyType(i)] = fmt.Sprintf("hierarchy %d", i)
+	}
+	return ret
 }
 
 func (tn *testNamer) MomentString(t time.Duration) string {
@@ -288,6 +296,22 @@ func TestElementarySpanBuilding(t *testing.T) {
 			return span, span.Suspend(trace.Comparator(), 20, 80, SuspendFissionsAroundElementarySpanEndpoints)
 		},
 		wantSpanStr: "() [p-] 0s-20ns, [p0] 50ns-50ns (O0), [p1] 50ns-50ns, [p2] 80ns-100ns",
+	}, {
+		description: "suspends can fission around multiple elementary span endpoints",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			if err := span.Suspend(trace.Comparator(), 80, 90); err != nil {
+				return nil, err
+			}
+			if err := span.Suspend(trace.Comparator(), 60, 70); err != nil {
+				return nil, err
+			}
+			if err := span.Suspend(trace.Comparator(), 40, 50); err != nil {
+				return nil, err
+			}
+			return span, span.Suspend(trace.Comparator(), 35, 100, SuspendFissionsAroundElementarySpanEndpoints)
+		},
+		wantSpanStr: "() [p-] 0s-35ns, [p0] 40ns-40ns, [p1] 50ns-50ns, [p2] 60ns-60ns, [p3] 70ns-70ns, [p4] 80ns-80ns, [p5] 90ns-90ns, [p6] 100ns-100ns",
 	}, {
 		description: "spans must be running at incoming dependences",
 		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {

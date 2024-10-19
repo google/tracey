@@ -147,7 +147,7 @@ c: 20ns-30ns
 d: 60ns-80ns`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			matchingSpans := FindSpans[time.Duration, payload, payload, payload](trace, &testNamer{}, test.matchers)
+			matchingSpans := findSpans(trace, &testNamer{}, test.matchers, SpanOnlyHierarchyType, nil)
 			gotMatchingSpansStrs := []string{}
 			for _, span := range matchingSpans {
 				gotMatchingSpansStrs = append(
@@ -217,7 +217,7 @@ func TestFindCategories(t *testing.T) {
 		wantMatchingCatsStr: `a/b/c, a/c/d`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			matchingCats := FindCategories[time.Duration, payload, payload, payload](trace, &testNamer{}, 0, test.matchers)
+			matchingCats := FindCategories(trace, &testNamer{}, 0, test.matchers)
 			gotMatchingCatsStrs := []string{}
 			for _, cat := range matchingCats {
 				path := []string{}

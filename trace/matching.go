@@ -19,6 +19,7 @@ package trace
 import (
 	"fmt"
 	"regexp"
+	"sort"
 )
 
 // PathElementMatcher describes types which can match
@@ -267,10 +268,12 @@ func FindSpanByEncodedIDPath[T any, CP, SP, DP fmt.Stringer](
 	for idx, pathEl := range path {
 		matchers[idx] = NewLiteralIDMatcher[T, CP, SP, DP](pathEl)
 	}
-	spans := FindSpans(
+	spans := findSpans(
 		trace,
 		namer,
 		[][]PathElementMatcher[T, CP, SP, DP]{matchers},
+		SpanOnlyHierarchyType,
+		nil,
 	)
 	if len(spans) != 1 {
 		return nil, fmt.Errorf("encoded span path %s matched %d spans; expected 1", encodedIDPath, len(spans))
@@ -278,14 +281,16 @@ func FindSpanByEncodedIDPath[T any, CP, SP, DP fmt.Stringer](
 	return spans[0], nil
 }
 
-// FindSpans finds and returns all spans from the provided trace whose stacks
+// findSpans finds and returns all spans from the provided trace whose stacks
 // match the provided matcher slice.
-func FindSpans[T any, CP, SP, DP fmt.Stringer](
+func findSpans[T any, CP, SP, DP fmt.Stringer](
 	trace Trace[T, CP, SP, DP],
 	namer Namer[T, CP, SP, DP],
-	matchers [][]PathElementMatcher[T, CP, SP, DP],
+	spanMatchers [][]PathElementMatcher[T, CP, SP, DP],
+	hierarchyType HierarchyType,
+	categoryMatchers [][]PathElementMatcher[T, CP, SP, DP],
 ) []Span[T, CP, SP, DP] {
-	if len(matchers) == 0 {
+	if len(spanMatchers) == 0 || (hierarchyType != SpanOnlyHierarchyType && len(categoryMatchers) == 0) {
 		return nil
 	}
 	includedSpans := map[Span[T, CP, SP, DP]]struct{}{}
@@ -299,11 +304,20 @@ func FindSpans[T any, CP, SP, DP fmt.Stringer](
 			}
 		}
 	}
-	rootSpans := make([]Span[T, CP, SP, DP], len(trace.RootSpans()))
-	for idx, rs := range trace.RootSpans() {
-		rootSpans[idx] = rs
+	var rootSpans []Span[T, CP, SP, DP]
+	if hierarchyType == SpanOnlyHierarchyType {
+		rootSpans = make([]Span[T, CP, SP, DP], len(trace.RootSpans()))
+		for idx, rs := range trace.RootSpans() {
+			rootSpans[idx] = rs
+		}
+	} else {
+		for _, cat := range FindCategories(trace, namer, hierarchyType, categoryMatchers) {
+			for _, span := range cat.RootSpans() {
+				rootSpans = append(rootSpans, span)
+			}
+		}
 	}
-	for _, matcherSlice := range matchers {
+	for _, matcherSlice := range spanMatchers {
 		visit[Span[T, CP, SP, DP], T, CP, SP, DP](
 			rootSpans,
 			matcherSlice,
@@ -358,6 +372,63 @@ func FindCategories[T any, CP, SP, DP fmt.Stringer](
 			},
 			addCategories,
 		)
+	}
+	return ret
+}
+
+// SpanFinder facilitates finding spans by pattern within a trace.
+type SpanFinder[T any, CP, SP, DP fmt.Stringer] struct {
+	namer            Namer[T, CP, SP, DP]
+	spanMatchers     [][]PathElementMatcher[T, CP, SP, DP]
+	categoryMatchers map[HierarchyType][][]PathElementMatcher[T, CP, SP, DP]
+}
+
+// NewSpanFinder returns a new SpanFinder, using the provided trace namer.
+func NewSpanFinder[T any, CP, SP, DP fmt.Stringer](
+	namer Namer[T, CP, SP, DP],
+) *SpanFinder[T, CP, SP, DP] {
+	return &SpanFinder[T, CP, SP, DP]{
+		namer:            namer,
+		categoryMatchers: map[HierarchyType][][]PathElementMatcher[T, CP, SP, DP]{},
+	}
+}
+
+// WithSpanMatchers adds the specified span matchers.
+func (sf *SpanFinder[T, CP, SP, DP]) WithSpanMatchers(
+	spanMatchers ...[]PathElementMatcher[T, CP, SP, DP],
+) *SpanFinder[T, CP, SP, DP] {
+	sf.spanMatchers = append(sf.spanMatchers, spanMatchers...)
+	return sf
+}
+
+// WithCategoryMatchers adds the specified span
+func (sf *SpanFinder[T, CP, SP, DP]) WithCategoryMatchers(
+	hierarchyType HierarchyType,
+	categoryMatchers ...[]PathElementMatcher[T, CP, SP, DP],
+) *SpanFinder[T, CP, SP, DP] {
+	if hierarchyType != SpanOnlyHierarchyType && len(categoryMatchers) > 0 {
+		sf.categoryMatchers[hierarchyType] = append(sf.categoryMatchers[hierarchyType], categoryMatchers...)
+	}
+	return sf
+}
+
+// Find returns all spans matching the receiver within the provided Trace.
+func (sf *SpanFinder[T, CP, SP, DP]) Find(
+	t Trace[T, CP, SP, DP],
+) []Span[T, CP, SP, DP] {
+	if len(sf.categoryMatchers) == 0 {
+		return findSpans(t, sf.namer, sf.spanMatchers, SpanOnlyHierarchyType, nil)
+	}
+	hts := make([]HierarchyType, 0, len(sf.categoryMatchers))
+	for ht := range sf.categoryMatchers {
+		hts = append(hts, ht)
+	}
+	sort.Slice(hts, func(a, b int) bool {
+		return hts[a] < hts[b]
+	})
+	ret := []Span[T, CP, SP, DP]{}
+	for _, ht := range hts {
+		ret = append(ret, findSpans(t, sf.namer, sf.spanMatchers, ht, sf.categoryMatchers[ht])...)
 	}
 	return ret
 }

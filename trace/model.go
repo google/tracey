@@ -1,19 +1,3 @@
-/*
-	Copyright 2024 Google Inc.
-
-	Licensed under the Apache License, Version 2.0 (the "License");
-	you may not use this file except in compliance with the License.
-	You may obtain a copy of the License at
-
-			http://www.apache.org/licenses/LICENSE-2.0
-
-	Unless required by applicable law or agreed to in writing, software
-	distributed under the License is distributed on an "AS IS" BASIS,
-	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
-	limitations under the License.
-*/
-
 // Package trace defines interfaces, types, and functions that facilitate
 // building traces suitable for visualization, analysis, and transformation.
 //
@@ -164,9 +148,13 @@ const (
 type HierarchyType uint
 
 const (
+	// SpanOnlyHierarchyType designates a hierarchy with no categories, and only
+	// spans.  Root spans form the top level of this hierarchy, and each non-root
+	// span is nested under its parent span.
+	SpanOnlyHierarchyType HierarchyType = iota
 	// FirstUserDefinedHierarchyType is the HierarchyType value at which
 	// specific trace libraries should begin enumerating their HierarchyTypes.
-	FirstUserDefinedHierarchyType HierarchyType = iota
+	FirstUserDefinedHierarchyType
 )
 
 // Namer describes types which can provide names for trace elements: categories
@@ -191,16 +179,28 @@ type Namer[T any, CP, SP, DP fmt.Stringer] interface {
 	// determined.
 	SpanUniqueID(span Span[T, CP, SP, DP]) string
 	// Returns a human-readable name for the provided HierarachyType.
-	HierarchyTypeName(ht HierarchyType) string
+	HierarchyTypeNames() map[HierarchyType]string
 	// Returns a human-readable name for the provided DependencyType.
-	DependencyTypeName(dt DependencyType) string
+	DependencyTypeNames() map[DependencyType]string
 	// Returns a human-readable representation of the provided moment.
 	MomentString(t T) string
+}
+
+// Wrapper wraps a raw Trace and may provide arbitrary trace-type-specific
+// members and methods, such as type-specific critical path endpoints, trace
+// context information, and so on.  Analysis tools that might depend on this
+// trace-type-specific information should work with Wrappers instead of raw
+// Traces.
+type Wrapper[T any, CP, SP, DP fmt.Stringer] interface {
+	Trace() Trace[T, CP, SP, DP]
 }
 
 // Trace is an entire trace (as defined above): a set of potentially-nested Spans
 // interconnected with Dependencies, and zero or more Category hierarchies.
 type Trace[T any, CP, SP, DP fmt.Stringer] interface {
+	// All traces serve as their own Wrappers, so that analysis tools can
+	// flexibly work with Traces directly or with their wrappers.
+	Wrapper[T, CP, SP, DP]
 	// Creates and returns a new root Category of the specified HierarchyType,
 	// and with the specified payload, under the receiver.
 	NewRootCategory(ht HierarchyType, payload CP) Category[T, CP, SP, DP]

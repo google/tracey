@@ -81,7 +81,10 @@ c: 20ns-30ns
 d: 60ns-80ns`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			selection := SelectSpans[time.Duration, payload, payload, payload](trace, &testNamer{}, test.matchers)
+			selection := SelectSpans(
+				trace,
+				NewSpanFinder(&testNamer{}).WithSpanMatchers(test.matchers...),
+			)
 			matchingSpans := selection.Spans()
 			gotMatchingSpansStrs := []string{}
 			for _, span := range matchingSpans {
@@ -110,14 +113,14 @@ func TestSpanSelectionIncludes(t *testing.T) {
 	if err != nil {
 		t.Errorf(err.Error())
 	}
-	ss := SelectSpans[time.Duration, payload, payload, payload](
+	ss := SelectSpans(
 		trace,
-		&testNamer{},
-		matchers(pathMatcher(
-			matchLiteralName("parent"),
-			matchStar,
-			matchStar,
-		),
+		NewSpanFinder(&testNamer{}).WithSpanMatchers(
+			pathMatcher(
+				matchLiteralName("parent"),
+				matchStar,
+				matchStar,
+			),
 		),
 	)
 	if !ss.Includes(grandchild) {
@@ -184,7 +187,7 @@ func TestCategorySelectionFullExpansion(t *testing.T) {
 		wantMatchingCategoriesStr: `c,d`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			selection := SelectCategories[time.Duration, payload, payload, payload](trace, &testNamer{}, 0, test.matchers)
+			selection := SelectCategories(trace, &testNamer{}, 0, test.matchers)
 			matchingCategories := selection.Categories(0)
 			gotMatchingCategoriesStrs := []string{}
 			for _, category := range matchingCategories {
@@ -207,7 +210,7 @@ func TestCategorySelectionIncludes(t *testing.T) {
 	span := trace.NewRootCategory(0, "parent")
 	child := span.NewChildCategory("child")
 	grandchild := child.NewChildCategory("grandchild")
-	ss := SelectCategories[time.Duration, payload, payload, payload](
+	ss := SelectCategories(
 		trace,
 		&testNamer{},
 		0,
@@ -243,11 +246,14 @@ func TestDependencySelection(t *testing.T) {
 		t.Errorf(err.Error())
 	}
 
-	sd := SelectDependencies[time.Duration, payload, payload, payload](
+	sd := SelectDependencies(
 		trace,
-		&testNamer{},
-		matchers(literalNameMatchers("parent", "child", "grandchild")),
-		matchers(literalNameMatchers("parent")),
+		NewSpanFinder(&testNamer{}).WithSpanMatchers(
+			matchers(literalNameMatchers("parent", "child", "grandchild"))...,
+		),
+		NewSpanFinder(&testNamer{}).WithSpanMatchers(
+			matchers(literalNameMatchers("parent"))...,
+		),
 		3,
 	)
 	if !sd.Includes(grandchild, span, 3) {

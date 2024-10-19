@@ -75,6 +75,11 @@ func NewMutableTrace[T any, CP, SP, DP fmt.Stringer](
 	return ret
 }
 
+// Traces can serve as their own wrappers.
+func (t *trace[T, CP, SP, DP]) Trace() Trace[T, CP, SP, DP] {
+	return t
+}
+
 func (t *trace[T, CP, SP, DP]) Comparator() Comparator[T] {
 	return t.comparator
 }
@@ -119,7 +124,7 @@ func (t *trace[T, CP, SP, DP]) NewRootSpan(start, end T, payload SP) RootSpan[T,
 		parentCategoriesByHierarchyType: map[HierarchyType]Category[T, CP, SP, DP]{},
 	}
 	t.rootSpans = append(t.rootSpans, ret)
-	ret.elementarySpans = append(ret.elementarySpans, makeInitialElementarySpan[T, CP, SP, DP](ret))
+	ret.elementarySpans = append(ret.elementarySpans, makeInitialElementarySpan(ret))
 	return ret
 }
 
@@ -289,7 +294,7 @@ func assembleSuspendOptions(options ...SuspendOption) SuspendOption {
 	return ret
 }
 
-func (ess *elementarySpanSequence[T, CP, SP, DP]) singleSuspend(
+func (ess *elementarySpanSequence[T, CP, SP, DP]) suspendWithinOneElementarySpan(
 	comparator Comparator[T],
 	start, end T,
 ) error {
@@ -324,6 +329,14 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) Suspend(
 ) error {
 	opts := assembleSuspendOptions(options...)
 	if opts&SuspendFissionsAroundElementarySpanEndpoints == SuspendFissionsAroundElementarySpanEndpoints {
+		// Suspends were requested to fission around elementary span endpoints.
+		// Work `end` backwards from the original endpoint until it is earlier than
+		// `start`, and at each iteration:
+		//   * find the elementary span E containing `end`;
+		//   * suspend E from its start to `end` (which fissions E);
+		//   * If (before the fission) E was not the first elementary span and it
+		//     had the predecessor P, set `end` to P.End()
+		//   * Otherwise, there's no more to be done.
 		for comparator.Greater(end, start) {
 			endSpanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, end)
 			if !found {
@@ -334,14 +347,21 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) Suspend(
 			if comparator.Greater(start, chunkStart) {
 				chunkStart = start
 			}
-			if err := ess.singleSuspend(comparator, chunkStart, end); err != nil {
+			if err := ess.suspendWithinOneElementarySpan(comparator, chunkStart, end); err != nil {
 				return err
 			}
-			end = endSpan.Start()
+			if endSpanIdx > 0 {
+				previousSpan := ess.elementarySpanAt(endSpanIdx - 1)
+				end = previousSpan.End()
+			} else {
+				break
+			}
 		}
 		return nil
 	}
-	return ess.singleSuspend(comparator, start, end)
+	// Suspends should not fission around elementary span endpoints.  Expect to
+	// suspend within a single elementary span, and fail if that isn't possible.
+	return ess.suspendWithinOneElementarySpan(comparator, start, end)
 }
 
 // Returns the *elementarySpan in the receiver at the specified index.  The
@@ -599,7 +619,7 @@ func (cs *commonSpan[T, CP, SP, DP]) newChildSpan(
 	child := &nonRootSpan[T, CP, SP, DP]{
 		commonSpan: newCommonSpan[T, CP, SP, DP](start, end, payload),
 	}
-	child.elementarySpans = append(child.elementarySpans, makeInitialElementarySpan[T, CP, SP, DP](child))
+	child.elementarySpans = append(child.elementarySpans, makeInitialElementarySpan(child))
 	call := &dependency[T, CP, SP, DP]{
 		dependencyType: Call,
 	}
