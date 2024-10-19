@@ -1,5 +1,5 @@
-module github.com/google/tracey
+module tracey
 
-go 1.20
+go 1.23.2
 
-require github.com/google/go-cmp v0.6.0
+require github.com/google/go-cmp v0.6.0 // indirect
