@@ -71,15 +71,15 @@ func (t *Transform[T, CP, SP, DP]) WithSpanPayloadMapping(
 // the provided list of DependencyTypes are considered to match; if the
 // provided set of DependencyTypes is empty, all DependencyTypes match.
 func (t *Transform[T, CP, SP, DP]) WithDependenciesScaledBy(
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP],
 	matchingDependencyTypes []trace.DependencyType,
 	durationScalingFactor float64,
 ) *Transform[T, CP, SP, DP] {
 	t.modifyDependencyTransforms = append(
 		t.modifyDependencyTransforms,
 		&modifyDependencyTransform[T, CP, SP, DP]{
-			originSpanMatchers:      originSpanMatchers,
-			destinationSpanMatchers: destinationSpanMatchers,
+			originSpanFinder:        originSpanFinder,
+			destinationSpanFinder:   destinationSpanFinder,
 			matchingDependencyTypes: matchingDependencyTypes,
 			durationScalingFactor:   durationScalingFactor,
 		})
@@ -91,31 +91,29 @@ func (t *Transform[T, CP, SP, DP]) WithDependenciesScaledBy(
 // should have their non-suspended duration scaled by the provided scaling
 // factor.
 func (t *Transform[T, CP, SP, DP]) WithSpansScaledBy(
-	spanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	spanFinder *trace.SpanFinder[T, CP, SP, DP],
 	durationScalingFactor float64,
 ) *Transform[T, CP, SP, DP] {
 	t.modifySpanTransforms = append(t.modifySpanTransforms, &modifySpanTransform[T, CP, SP, DP]{
-		spanMatchers:             spanMatchers,
+		spanFinder:               spanFinder,
 		hasDurationScalingFactor: true,
 		durationScalingFactor:    durationScalingFactor,
 	})
 	return t
 }
 
-// WithSpansStartingAt specifies that, during transformation, all Spans
-// matching any of the provided matchers (with nil SpanMatchers matching
-// everything) start at the specified point unless pushed back by later-
-// resolving Dependencies.  Spans not affected by this transformation start at
-// their original start point, unless pushed back by later-resolving
+// WithSpansStartingAsEarlyAsPossible specifies that, during transformation,
+// all Spans matching any of the provided matchers (with nil SpanMatchers
+// matching everything) start at the specified point unless pushed back by
+// later-resolving Dependencies.  Spans not affected by this transformation
+// start at their original start point, unless pushed back by later-resolving
 // Dependencies.
-func (t *Transform[T, CP, SP, DP]) WithSpansStartingAt(
-	spanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
-	newStart T,
+func (t *Transform[T, CP, SP, DP]) WithSpansStartingAsEarlyAsPossible(
+	spanFinder *trace.SpanFinder[T, CP, SP, DP],
 ) *Transform[T, CP, SP, DP] {
 	t.modifySpanTransforms = append(t.modifySpanTransforms, &modifySpanTransform[T, CP, SP, DP]{
-		spanMatchers: spanMatchers,
-		hasNewStart:  true,
-		newStart:     newStart,
+		spanFinder:              spanFinder,
+		startsAsEarlyAsPossible: true,
 	})
 	return t
 }
@@ -132,13 +130,13 @@ func (t *Transform[T, CP, SP, DP]) WithSpansStartingAt(
 // incoming dependency that ElementarySpan might have (such as a future) should
 // not artificially push that ElementarySpan's start point back.
 func (t *Transform[T, CP, SP, DP]) WithShrinkableIncomingDependencies(
-	destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP],
 	dependencyTypes []trace.DependencyType,
 	shrinkStartOffset float64,
 ) *Transform[T, CP, SP, DP] {
 	t.modifyDependencyTransforms = append(t.modifyDependencyTransforms, &modifyDependencyTransform[T, CP, SP, DP]{
-		originSpanMatchers:               nil,
-		destinationSpanMatchers:          destinationSpanMatchers,
+		originSpanFinder:                 nil,
+		destinationSpanFinder:            destinationSpanFinder,
 		matchingDependencyTypes:          dependencyTypes,
 		mayShrinkIfNotOriginallyBlocking: true,
 		mayShrinkToOriginOffset:          shrinkStartOffset,
@@ -148,26 +146,20 @@ func (t *Transform[T, CP, SP, DP]) WithShrinkableIncomingDependencies(
 
 // WithAddedDependencies specifies that, during transformation, a new
 // Dependency of the specified type and with the specified scheduling delay
-// should be placed between all Spans matching any of the provided origin
-// matchers and all Spans matching any of the provided destination matchers
-// (nil SpanMatchers match everything.)  Each new Dependency will originate at
-// the specified percentage through its origin Span, and will terminate at the
-// specified percentage through its destination Spans.
+// should be placed between the origin position (which must be unique in the
+// trace) and the destination positions.
 func (t *Transform[T, CP, SP, DP]) WithAddedDependencies(
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	originPosition, destinationPosition *trace.Position[T, CP, SP, DP],
 	dependencyType trace.DependencyType,
 	schedulingDelay float64,
-	percentageThroughOrigin, percentageThroughDestination float64,
 ) *Transform[T, CP, SP, DP] {
 	t.addDependencyTransforms = append(
 		t.addDependencyTransforms,
 		&addDependencyTransform[T, CP, SP, DP]{
-			originSpanMatchers:           originSpanMatchers,
-			destinationSpanMatchers:      destinationSpanMatchers,
-			dependencyType:               dependencyType,
-			schedulingDelay:              schedulingDelay,
-			percentageThroughOrigin:      percentageThroughOrigin,
-			percentageThroughDestination: percentageThroughDestination,
+			originPosition:      originPosition,
+			destinationPosition: destinationPosition,
+			dependencyType:      dependencyType,
+			schedulingDelay:     schedulingDelay,
 		},
 	)
 	return t
@@ -180,14 +172,14 @@ func (t *Transform[T, CP, SP, DP]) WithAddedDependencies(
 // DependencyTypes are considered to match; if the provided set of
 // DependencyTypes is empty, all DependencyTypes match.
 func (t *Transform[T, CP, SP, DP]) WithRemovedDependencies(
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP],
 	matchingDependencyTypes []trace.DependencyType,
 ) *Transform[T, CP, SP, DP] {
 	t.removeDependencyTransforms = append(
 		t.removeDependencyTransforms,
 		&removeDependencyTransform[T, CP, SP, DP]{
-			originSpanMatchers:      originSpanMatchers,
-			destinationSpanMatchers: destinationSpanMatchers,
+			originSpanFinder:        originSpanFinder,
+			destinationSpanFinder:   destinationSpanFinder,
 			matchingDependencyTypes: matchingDependencyTypes,
 		},
 	)
@@ -202,12 +194,12 @@ func (t *Transform[T, CP, SP, DP]) WithRemovedDependencies(
 // SpanGater instance.  This can be used to apply arbitrary concurrency
 // constraints to a transformed Trace.
 func (t *Transform[T, CP, SP, DP]) WithSpansGatedBy(
-	spanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP],
+	spanFinder *trace.SpanFinder[T, CP, SP, DP],
 	spanGaterFn func() SpanGater[T, CP, SP, DP],
 ) *Transform[T, CP, SP, DP] {
 	t.gatedSpanTransforms = append(t.gatedSpanTransforms, &gatedSpanTransform[T, CP, SP, DP]{
-		spanMatchers: spanMatchers,
-		spanGaterFn:  spanGaterFn,
+		spanFinder:  spanFinder,
+		spanGaterFn: spanGaterFn,
 	})
 	return t
 }
@@ -216,20 +208,18 @@ func (t *Transform[T, CP, SP, DP]) WithSpansGatedBy(
 // transformations, returning a new, transformed trace.
 func (t *Transform[T, CP, SP, DP]) TransformTrace(
 	original trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) (trace.Trace[T, CP, SP, DP], error) {
-	at, err := t.apply(original, namer)
+	at, err := t.apply(original)
 	if err != nil {
 		return nil, err
 	}
-	return transformTrace(original, namer, at)
+	return transformTrace(original, at)
 }
 
 // Returns an appliedTransforms specifying the receiver to the provided
 // Trace and Namer.
 func (t *Transform[T, CP, SP, DP]) apply(
 	original trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) (*appliedTransforms[T, CP, SP, DP], error) {
 	ret := &appliedTransforms[T, CP, SP, DP]{
 		categoryPayloadMapping: t.categoryPayloadMapping,
@@ -237,30 +227,27 @@ func (t *Transform[T, CP, SP, DP]) apply(
 	}
 	ret.appliedSpanModifications = make([]*appliedSpanModifications[T, CP, SP, DP], len(t.modifySpanTransforms))
 	for idx, mst := range t.modifySpanTransforms {
-		ms := mst.selectModifiedSpans(original, namer)
+		ms := mst.selectModifiedSpans(original)
 		ret.appliedSpanModifications[idx] = ms
 	}
 	ret.appliedSpanGates = make([]*appliedSpanGates[T, CP, SP, DP], len(t.gatedSpanTransforms))
 	for idx, gst := range t.gatedSpanTransforms {
-		gs := gst.selectGatedSpans(original, namer)
+		gs := gst.selectGatedSpans(original)
 		ret.appliedSpanGates[idx] = gs
 	}
 	ret.appliedDependencyModifications = make([]*appliedDependencyModifications[T, CP, SP, DP], len(t.modifyDependencyTransforms))
 	for idx, mdt := range t.modifyDependencyTransforms {
-		md := mdt.selectModifiedDependencies(original, namer)
+		md := mdt.selectModifiedDependencies(original)
 		ret.appliedDependencyModifications[idx] = md
 	}
 	ret.appliedDependencyAdditions = make([]*appliedDependencyAdditions[T, CP, SP, DP], len(t.addDependencyTransforms))
 	for idx, adt := range t.addDependencyTransforms {
-		ad, err := adt.selectAddedDependencies(original, namer)
-		if err != nil {
-			return nil, err
-		}
+		ad := adt.selectAddedDependencies(original)
 		ret.appliedDependencyAdditions[idx] = ad
 	}
 	ret.appliedDependencyRemovals = make([]*appliedDependencyRemovals[T, CP, SP, DP], len(t.removeDependencyTransforms))
 	for idx, rdt := range t.removeDependencyTransforms {
-		rd := rdt.selectRemovedDependencies(original, namer)
+		rd := rdt.selectRemovedDependencies(original)
 		ret.appliedDependencyRemovals[idx] = rd
 	}
 	return ret, nil
@@ -270,12 +257,11 @@ func (t *Transform[T, CP, SP, DP]) apply(
 // dependencyModifications instance specific to that that trace.
 func (mdt *modifyDependencyTransform[T, CP, SP, DP]) selectModifiedDependencies(
 	t trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) *appliedDependencyModifications[T, CP, SP, DP] {
 	dependencySelection := trace.SelectDependencies(
-		t, namer,
-		mdt.originSpanMatchers,
-		mdt.destinationSpanMatchers,
+		t,
+		mdt.originSpanFinder,
+		mdt.destinationSpanFinder,
 		mdt.matchingDependencyTypes...,
 	)
 	return &appliedDependencyModifications[T, CP, SP, DP]{
@@ -288,11 +274,10 @@ func (mdt *modifyDependencyTransform[T, CP, SP, DP]) selectModifiedDependencies(
 // spanModifications instance specific to that that trace.
 func (mst *modifySpanTransform[T, CP, SP, DP]) selectModifiedSpans(
 	t trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) *appliedSpanModifications[T, CP, SP, DP] {
 	spanSelection := trace.SelectSpans(
-		t, namer,
-		mst.spanMatchers,
+		t,
+		mst.spanFinder,
 	)
 	return &appliedSpanModifications[T, CP, SP, DP]{
 		mst:           mst,
@@ -304,15 +289,14 @@ func (mst *modifySpanTransform[T, CP, SP, DP]) selectModifiedSpans(
 // dependencyAdditions instance specific to that that trace.
 func (adt *addDependencyTransform[T, CP, SP, DP]) selectAddedDependencies(
 	t trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
-) (*appliedDependencyAdditions[T, CP, SP, DP], error) {
-	originSpans := trace.SelectSpans(t, namer, adt.originSpanMatchers).Spans()
-	if len(originSpans) > 1 {
-		return nil, fmt.Errorf("at most one origin span must be designated when adding dependencies (got %d)", len(originSpans))
+) *appliedDependencyAdditions[T, CP, SP, DP] {
+	originSpans := trace.SelectSpans(t, adt.originPosition.SpanFinder()).Spans()
+	if len(originSpans) == 0 || len(originSpans) > 1 {
+		return nil
 	}
-	destinationSpans := trace.SelectSpans(t, namer, adt.destinationSpanMatchers)
+	destinationSpans := trace.SelectSpans(t, adt.destinationPosition.SpanFinder())
 	if len(destinationSpans.Spans()) == 0 {
-		return nil, fmt.Errorf("at least one destination span must be designated when adding dependencies")
+		return nil
 	}
 	ret := &appliedDependencyAdditions[T, CP, SP, DP]{
 		adt:                        adt,
@@ -320,19 +304,18 @@ func (adt *addDependencyTransform[T, CP, SP, DP]) selectAddedDependencies(
 		selectedDestinationSpans:   destinationSpans,
 		destinationsByOriginalSpan: map[trace.Span[T, CP, SP, DP]]elementarySpanTransformer[T, CP, SP, DP]{},
 	}
-	return ret, nil
+	return ret
 }
 
 // Applies the receiver to a particular trace and namer, returning a
 // dependencyRemovals instance specific to that that trace.
 func (rdt *removeDependencyTransform[T, CP, SP, DP]) selectRemovedDependencies(
 	t trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) *appliedDependencyRemovals[T, CP, SP, DP] {
 	dependencySelection := trace.SelectDependencies(
-		t, namer,
-		rdt.originSpanMatchers,
-		rdt.destinationSpanMatchers,
+		t,
+		rdt.originSpanFinder,
+		rdt.destinationSpanFinder,
 		rdt.matchingDependencyTypes...,
 	)
 	return &appliedDependencyRemovals[T, CP, SP, DP]{
@@ -345,11 +328,10 @@ func (rdt *removeDependencyTransform[T, CP, SP, DP]) selectRemovedDependencies(
 // spanGates instance specific to that that trace.
 func (gst *gatedSpanTransform[T, CP, SP, DP]) selectGatedSpans(
 	t trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 ) *appliedSpanGates[T, CP, SP, DP] {
 	spanSelection := trace.SelectSpans(
-		t, namer,
-		gst.spanMatchers,
+		t,
+		gst.spanFinder,
 	)
 	return &appliedSpanGates[T, CP, SP, DP]{
 		gst:           gst,
@@ -363,8 +345,10 @@ func (at *appliedTransforms[T, CP, SP, DP]) findDependencyAdditionsByOriginalOri
 ) []*appliedDependencyAdditions[T, CP, SP, DP] {
 	ret := []*appliedDependencyAdditions[T, CP, SP, DP]{}
 	for _, dependencyAddition := range at.appliedDependencyAdditions {
-		if dependencyAddition.originSpan == originalOrigin {
-			ret = append(ret, dependencyAddition)
+		if dependencyAddition != nil {
+			if dependencyAddition.originSpan == originalOrigin {
+				ret = append(ret, dependencyAddition)
+			}
 		}
 	}
 	return ret
@@ -375,18 +359,20 @@ func (at *appliedTransforms[T, CP, SP, DP]) findDependencyAdditionsByOriginalDes
 ) []*appliedDependencyAdditions[T, CP, SP, DP] {
 	ret := []*appliedDependencyAdditions[T, CP, SP, DP]{}
 	for _, dependencyAddition := range at.appliedDependencyAdditions {
-		if dependencyAddition.selectedDestinationSpans.Includes(originalDestination) {
-			ret = append(ret, dependencyAddition)
+		if dependencyAddition != nil {
+			if dependencyAddition.selectedDestinationSpans.Includes(originalDestination) {
+				ret = append(ret, dependencyAddition)
+			}
 		}
 	}
 	return ret
 }
 
-func (ad *addedDependency[T, CP, SP, DP]) percentageThrough() float64 {
+func (ad *addedDependency[T, CP, SP, DP]) fractionThrough() float64 {
 	if ad.outgoingHere {
-		return ad.dependencyAdditions.adt.percentageThroughOrigin
+		return ad.dependencyAdditions.adt.originPosition.FractionThrough()
 	}
-	return ad.dependencyAdditions.adt.percentageThroughDestination
+	return ad.dependencyAdditions.adt.destinationPosition.FractionThrough()
 }
 
 func (at *appliedTransforms[T, CP, SP, DP]) getAddedDependencies(
@@ -412,9 +398,9 @@ func (at *appliedTransforms[T, CP, SP, DP]) getAddedDependencies(
 		})
 	}
 	sort.Slice(ret, func(a, b int) bool {
-		aPercentageThrough := ret[a].percentageThrough()
-		bPercentageThrough := ret[b].percentageThrough()
-		if aPercentageThrough == bPercentageThrough {
+		aFractionThrough := ret[a].fractionThrough()
+		bFractionThrough := ret[b].fractionThrough()
+		if aFractionThrough == bFractionThrough {
 			// If there's a tie, make sure the outgoing change is emitted first.
 			// This should avoid excess zero-width elementary spans.
 			if ret[a].outgoingHere {
@@ -422,7 +408,7 @@ func (at *appliedTransforms[T, CP, SP, DP]) getAddedDependencies(
 			}
 			return true
 		}
-		return ret[a].percentageThrough() < ret[b].percentageThrough()
+		return ret[a].fractionThrough() < ret[b].fractionThrough()
 	})
 	return ret
 }

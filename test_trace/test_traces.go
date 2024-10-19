@@ -22,6 +22,32 @@ import (
 	"github.com/google/tracey/trace"
 )
 
+// TestNamer defines a trace.Namer for test traces constructed with this
+// package.
+var TestNamer = &stringTraceNamer{}
+
+type testUnserializer struct{}
+
+func (tu *testUnserializer) UnserializeSpanPayload(payload []byte) (StringPayload, error) {
+	return StringPayload(payload), nil
+}
+
+func (tu *testUnserializer) UnserializeCategoryPayload(payload []byte) (StringPayload, error) {
+	return StringPayload(payload), nil
+}
+
+func (tu *testUnserializer) UnserializeDependencyPayload(payload []byte) (StringPayload, error) {
+	return StringPayload(payload), nil
+}
+
+func (tu *testUnserializer) DefaultNamer() trace.Namer[time.Duration, StringPayload, StringPayload, StringPayload] {
+	return TestNamer
+}
+
+// TestUnserializer is a payload unserializer for traces constructed
+// with this package.
+var TestUnserializer = &testUnserializer{}
+
 // TPP is a test prettyprinter usable with the Traces defined in this file.
 var TPP = NewPrettyPrinter[time.Duration, StringPayload, StringPayload, StringPayload](
 	HierarchyTypeNames, DependencyTypeNames,

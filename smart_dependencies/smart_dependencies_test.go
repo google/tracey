@@ -25,9 +25,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-func pathMatchers(t *testing.T, strs ...string) [][]trace.PathElementMatcher[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
+func spanFinder(t *testing.T, strs ...string) *trace.SpanFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
 	t.Helper()
-	ret, err := testtrace.PathMatchersFromPattern(strs)
+	ret, err := testtrace.SpanFinderFromPattern(strs)
 	if err != nil {
 		t.Fatalf("failed to build path matchers: %s", err)
 	}
@@ -77,7 +77,8 @@ func TestSmartDependencies(t *testing.T) {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
 			noOrigin.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 100,
+				spanFinder(t, "b").Find(tr)[0],
+				100,
 			)
 		},
 		hierarchyType: testtrace.None,
@@ -102,7 +103,8 @@ Trace spans:
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
 			noDestination.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 100,
+				spanFinder(t, "a").Find(tr)[0],
+				100,
 			)
 		},
 		hierarchyType: testtrace.None,
@@ -124,7 +126,8 @@ Trace spans:
 		) {
 			noOrigin := sds.NewUnindexed(testtrace.Send, "", KeepDependenciesWithoutOriginsOrDestinations)
 			noOrigin.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 50,
+				spanFinder(t, "b").Find(tr)[0],
+				50,
 			)
 		},
 		hierarchyType: testtrace.None,
@@ -147,7 +150,8 @@ Trace spans:
 		) {
 			noDestination := sds.NewUnindexed(testtrace.Send, "", KeepDependenciesWithoutOriginsOrDestinations)
 			noDestination.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 100,
+				spanFinder(t, "a").Find(tr)[0],
+				100,
 			)
 		},
 		hierarchyType: testtrace.None,
@@ -174,10 +178,12 @@ Trace spans:
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 50,
+				spanFinder(t, "a").Find(tr)[0],
+				50,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 50,
+				spanFinder(t, "b").Find(tr)[0],
+				50,
 			)
 		},
 		hierarchyType: testtrace.None,
@@ -204,25 +210,32 @@ Trace spans:
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 10,
+				spanFinder(t, "a").Find(tr)[0],
+				10,
 			)
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 30,
+				spanFinder(t, "a").Find(tr)[0],
+				30,
 			)
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 60,
+				spanFinder(t, "a").Find(tr)[0],
+				60,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 5,
+				spanFinder(t, "b").Find(tr)[0],
+				5,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 20,
+				spanFinder(t, "b").Find(tr)[0],
+				20,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 40,
+				spanFinder(t, "b").Find(tr)[0],
+				40,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 50,
+				spanFinder(t, "b").Find(tr)[0],
+				50,
 			)
 		},
 		wantSDErr:     true,
@@ -248,25 +261,32 @@ Trace spans:
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 10,
+				spanFinder(t, "a").Find(tr)[0],
+				10,
 			)
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 30,
+				spanFinder(t, "a").Find(tr)[0],
+				30,
 			)
 			dep.WithOrigin(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "a"))[0], 60,
+				spanFinder(t, "a").Find(tr)[0],
+				60,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 5,
+				spanFinder(t, "b").Find(tr)[0],
+				5,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 20,
+				spanFinder(t, "b").Find(tr)[0],
+				20,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 40,
+				spanFinder(t, "b").Find(tr)[0],
+				40,
 			)
 			dep.WithDestination(
-				trace.FindSpans(tr, tr.DefaultNamer(), pathMatchers(t, "b"))[0], 50,
+				spanFinder(t, "b").Find(tr)[0],
+				50,
 			)
 		},
 		hierarchyType: testtrace.None,

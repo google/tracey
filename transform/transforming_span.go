@@ -24,12 +24,17 @@ import (
 
 // A span under construction in a transforming Trace.
 type transformingSpan[T any, CP, SP, DP fmt.Stringer] struct {
+	tt traceTransformer[T, CP, SP, DP]
 	// The original Span.
 	originalSpan trace.Span[T, CP, SP, DP]
 	// The Span modification applied to this Span.
 	msts []*modifySpanTransform[T, CP, SP, DP]
 	// The temporally-ordered transforming ElementarySpans within this Span.
 	ess []elementarySpanTransformer[T, CP, SP, DP]
+}
+
+func (ts *transformingSpan[T, CP, SP, DP]) traceTransformer() traceTransformer[T, CP, SP, DP] {
+	return ts.tt
 }
 
 func (ts *transformingSpan[T, CP, SP, DP]) original() trace.Span[T, CP, SP, DP] {
@@ -72,7 +77,6 @@ func newTransformingSpan[T any, CP, SP, DP fmt.Stringer](
 
 // A helper for properly assembling transformingSpans.
 type transformingSpanBuilder[T any, CP, SP, DP fmt.Stringer] struct {
-	tt traceTransformer[T, CP, SP, DP]
 	// The new Span being transformed.
 	span *transformingSpan[T, CP, SP, DP]
 	// The duration of the original Span.  Used to satisfy 'percentage-through'
@@ -98,8 +102,8 @@ func newTransformingSpanBuilder[T any, CP, SP, DP fmt.Stringer](
 	originalSpan trace.Span[T, CP, SP, DP],
 ) (*transformingSpanBuilder[T, CP, SP, DP], error) {
 	ret := &transformingSpanBuilder[T, CP, SP, DP]{
-		tt: tt,
 		span: &transformingSpan[T, CP, SP, DP]{
+			tt:           tt,
 			originalSpan: originalSpan,
 			ess:          make([]elementarySpanTransformer[T, CP, SP, DP], 0, len(originalSpan.ElementarySpans())),
 			msts:         tt.appliedTransformations().getSpanModifications(originalSpan),
@@ -109,12 +113,12 @@ func newTransformingSpanBuilder[T any, CP, SP, DP fmt.Stringer](
 	}
 	offsetAdjustmentChanged := false
 	for _, mst := range ret.span.msts {
-		if mst.hasNewStart {
+		if mst.startsAsEarlyAsPossible {
 			if offsetAdjustmentChanged {
 				return nil, fmt.Errorf("multiple start offset changes applied to span %s", tt.namer().SpanName(originalSpan))
 			}
 			ret.startOffsetAdjustment = tt.comparator().Diff(
-				mst.newStart,
+				tt.start(),
 				originalSpan.Start(),
 			)
 			offsetAdjustmentChanged = true
@@ -140,13 +144,13 @@ func (tsb *transformingSpanBuilder[T, CP, SP, DP]) pushTransformingElementarySpa
 	start, end T,
 	initiallyBlockedByPredecessor bool,
 ) (elementarySpanTransformer[T, CP, SP, DP], error) {
-	adjustedStart := tsb.tt.comparator().Add(
+	adjustedStart := tsb.span.traceTransformer().comparator().Add(
 		start,
 		tsb.startOffsetAdjustment,
 	)
-	duration := tsb.tt.comparator().Diff(end, start)
-	tes := newTransformingElementarySpan[T, CP, SP, DP](
-		tsb.tt, tsb.lastES, tsb.span,
+	duration := tsb.span.traceTransformer().comparator().Diff(end, start)
+	tes := newTransformingElementarySpan(
+		tsb.span, tsb.lastES, tsb.span,
 		adjustedStart, duration,
 		initiallyBlockedByPredecessor,
 		tsb.incomingDependenciesMayShrinkIfNotOriginallyBlocking,
@@ -168,7 +172,7 @@ func (tsb *transformingSpanBuilder[T, CP, SP, DP]) pushOriginalElementarySpan(
 	tes, err := tsb.pushTransformingElementarySpan(
 		original.Start(), original.End(),
 		original.Predecessor() != nil &&
-			tsb.tt.comparator().Equal(original.Predecessor().End(), original.Start()),
+			tsb.span.traceTransformer().comparator().Equal(original.Predecessor().End(), original.Start()),
 	)
 	if err != nil {
 		return err
@@ -189,17 +193,18 @@ func (tsb *transformingSpanBuilder[T, CP, SP, DP]) pushOriginalElementarySpan(
 // placed are returned.
 func (tsb *transformingSpanBuilder[T, CP, SP, DP]) findNextAddedDependency(start, end T) (at T, ad *addedDependency[T, CP, SP, DP]) {
 	if len(tsb.dependencyAdditions) > 0 {
-		nextOriginatingPoint := tsb.tt.comparator().Add(
+		nextOriginatingPoint := tsb.span.traceTransformer().comparator().Add(
 			tsb.span.original().Start(),
-			tsb.spanDuration*tsb.dependencyAdditions[0].percentageThrough(),
+			tsb.spanDuration*(tsb.dependencyAdditions[0].fractionThrough()),
 		)
+		//	nextOriginatingPoint, tsb.span.original().Start(), tsb.spanDuration, (tsb.dependencyAdditions[0].fractionThrough()))
 		// Place the dependence at the first viable point at or after the requested
 		// percentageThroughOrigin.
-		if tsb.tt.comparator().LessOrEqual(nextOriginatingPoint, end) {
+		if tsb.span.traceTransformer().comparator().LessOrEqual(nextOriginatingPoint, end) {
 			// The dependency origin time is the later of the start time and the next
 			// added dependency point.
 			at = start
-			if tsb.tt.comparator().Less(at, nextOriginatingPoint) {
+			if tsb.span.traceTransformer().comparator().Less(at, nextOriginatingPoint) {
 				at = nextOriginatingPoint
 			}
 			ad, tsb.dependencyAdditions = tsb.dependencyAdditions[0], tsb.dependencyAdditions[1:]
@@ -249,15 +254,17 @@ func (tsb *transformingSpanBuilder[T, CP, SP, DP]) transformNextOriginalElementa
 		tsb.pushOriginalElementarySpan(original)
 		return nil
 	}
-	// An added dependency was found.  Emit an initial fractional ElementarySpan
-	// representing the start of the original, and any incoming dependency it
-	// might have.
-	if err := tsb.pushNewElementarySpan(original.Start(), nextStart, nil, nextAD); err != nil {
-		return err
-	}
-	if err := tsb.lastES.
-		setOriginalIncomingDependency(original, original.Incoming()); err != nil {
-		return err
+	// At least one dependency was added.  If there's an original incoming
+	// dependency, emit an initial fractional ElementarySpan to hold it.
+	if tsb.span.traceTransformer().comparator().Less(original.Start(), nextStart) ||
+		original.Incoming() != nil {
+		if err := tsb.pushNewElementarySpan(original.Start(), nextStart, nil, nextAD); err != nil {
+			return err
+		}
+		if err := tsb.lastES.
+			setOriginalIncomingDependency(original, original.Incoming()); err != nil {
+			return err
+		}
 	}
 	lastStart, lastAD := nextStart, nextAD
 	nextStart, nextAD = tsb.findNextAddedDependency(lastStart, original.End())
@@ -271,11 +278,20 @@ func (tsb *transformingSpanBuilder[T, CP, SP, DP]) transformNextOriginalElementa
 	}
 	// If we've got time left in the original Span, or a pending incoming edge,
 	// produce one last ElementarySpan.
-	if !tsb.tt.comparator().Equal(lastStart, original.End()) ||
+	if !tsb.span.traceTransformer().comparator().Equal(lastStart, original.End()) ||
 		(lastAD != nil && !lastAD.outgoingHere) {
 		tsb.pushNewElementarySpan(lastStart, original.End(), lastAD, nil)
 	}
-	// Add any outgoing dependency from the original ElementarySpan to the last
-	// new fractional ElementarySpan.
-	return tsb.lastES.setOriginalOutgoingDependency(original.Outgoing())
+	// If the original ElementarySpan had an outgoing dependency, and there's now
+	// a new outgoing dependency at the end of the transformed ElementarySpan,
+	// emit a new fractional ELementarySpan to hold the original outgoing dep.
+	if original.Outgoing() != nil {
+		if tsb.lastES.hasOutgoingDep() {
+			if err := tsb.pushNewElementarySpan(original.End(), original.End(), nil, nil); err != nil {
+				return err
+			}
+		}
+		return tsb.lastES.setOriginalOutgoingDependency(original.Outgoing())
+	}
+	return nil
 }

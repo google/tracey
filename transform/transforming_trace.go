@@ -30,10 +30,11 @@ type gatedElementarySpan[T any, CP, SP, DP fmt.Stringer] struct {
 
 // A Trace in the process of transforming.
 type transformingTrace[T any, CP, SP, DP fmt.Stringer] struct {
-	original trace.Trace[T, CP, SP, DP]
-	new      trace.MutableTrace[T, CP, SP, DP]
-	n        trace.Namer[T, CP, SP, DP]
-	ats      *appliedTransforms[T, CP, SP, DP]
+	original    trace.Trace[T, CP, SP, DP]
+	new         trace.MutableTrace[T, CP, SP, DP]
+	n           trace.Namer[T, CP, SP, DP]
+	ats         *appliedTransforms[T, CP, SP, DP]
+	firstMoment T
 
 	// A queue of ElementarySpans whose prior dependencies are all satisfied,
 	// ready to schedule.
@@ -58,6 +59,10 @@ func (tt *transformingTrace[T, CP, SP, DP]) comparator() trace.Comparator[T] {
 	return tt.original.Comparator()
 }
 
+func (tt *transformingTrace[T, CP, SP, DP]) start() T {
+	return tt.firstMoment
+}
+
 func (tt *transformingTrace[T, CP, SP, DP]) namer() trace.Namer[T, CP, SP, DP] {
 	return tt.n
 }
@@ -77,7 +82,7 @@ func (tt *transformingTrace[T, CP, SP, DP]) spanFromOriginal(
 	ret, ok := tt.transformingSpansByOriginal[original]
 	if !ok {
 		var err error
-		ret, err = newTransformingSpan[T, CP, SP, DP](tt, original)
+		ret, err = newTransformingSpan(tt, original)
 		if err != nil {
 			return nil, err
 		}
@@ -218,9 +223,19 @@ func (tt *transformingTrace[T, CP, SP, DP]) transformElementarySpans(
 // a span with no incoming Dependencies within the Trace) must also be a
 // RootSpan, this also places all initially-schedulable ElementarySpans on the
 // schedule queue.
-func (tt *transformingTrace[T, CP, SP, DP]) createRootSpans(original trace.Trace[T, CP, SP, DP]) error {
+func (tt *transformingTrace[T, CP, SP, DP]) createRootSpans(
+	original trace.Trace[T, CP, SP, DP],
+) error {
+	firstMomentSet := false
+	updateFirstMoment := func(span trace.Span[T, CP, SP, DP]) {
+		if !firstMomentSet || tt.comparator().Less(span.Start(), tt.firstMoment) {
+			tt.firstMoment = span.Start()
+			firstMomentSet = true
+		}
+	}
 	var visit func(originalSpan trace.Span[T, CP, SP, DP]) error
 	visit = func(originalSpan trace.Span[T, CP, SP, DP]) error {
+		updateFirstMoment(originalSpan)
 		if _, err := tt.spanFromOriginal(originalSpan); err != nil {
 			return err
 		}
@@ -232,6 +247,7 @@ func (tt *transformingTrace[T, CP, SP, DP]) createRootSpans(original trace.Trace
 		return nil
 	}
 	for _, originalRootSpan := range original.RootSpans() {
+		updateFirstMoment(originalRootSpan)
 		rs, err := tt.spanFromOriginal(originalRootSpan)
 		if err != nil {
 			return err
@@ -313,7 +329,6 @@ func (tt *transformingTrace[T, CP, SP, DP]) buildChildSpans(
 
 func transformTrace[T any, CP, SP, DP fmt.Stringer](
 	original trace.Trace[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 	ats *appliedTransforms[T, CP, SP, DP],
 ) (trace.Trace[T, CP, SP, DP], error) {
 	// Build a transformingTrace to manage the transformation.
@@ -323,7 +338,7 @@ func transformTrace[T any, CP, SP, DP fmt.Stringer](
 			original.Comparator(),
 			original.DefaultNamer(),
 		),
-		n:                                  namer,
+		n:                                  original.DefaultNamer(),
 		ats:                                ats,
 		transformingSpansByOriginal:        map[trace.Span[T, CP, SP, DP]]spanTransformer[T, CP, SP, DP]{},
 		transformingRootSpansByOriginal:    map[trace.RootSpan[T, CP, SP, DP]]spanTransformer[T, CP, SP, DP]{},
@@ -331,7 +346,9 @@ func transformTrace[T any, CP, SP, DP fmt.Stringer](
 	}
 	// Create a new Dependency for each added-Dependency transform.
 	for _, aad := range tt.ats.appliedDependencyAdditions {
-		aad.dep = tt.new.NewMutableDependency(aad.adt.dependencyType)
+		if aad != nil {
+			aad.dep = tt.new.NewMutableDependency(aad.adt.dependencyType)
+		}
 	}
 	// Create all RootSpans in the new trace, which also places all initially-
 	// schedulable ElementarySpans onto the scheduling queue.

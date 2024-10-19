@@ -24,20 +24,12 @@ import (
 
 // An ElementarySpan in a transforming Trace.
 type transformingElementarySpan[T any, CP, SP, DP fmt.Stringer] struct {
-	tt traceTransformer[T, CP, SP, DP]
+	spanTransformer spanTransformer[T, CP, SP, DP]
 	// The transformed ElementarySpan under construction.
 	newElementarySpan trace.MutableElementarySpan[T, CP, SP, DP]
-	// True if 'new' has its start time set.
-	hasNewStart bool
 	// The initial start point of the ElementarySpan.  The interval
 	// between these is the ElementarySpan's base duration.
 	initialStart T
-	// The initial duration (as from trace.Comparator.Diff(start, end)) of the
-	// ElementarySpan.
-	initialDuration float64
-	// If true, this elementary span was initially blocked by its predecessor:
-	// its start time equaled its predecessor's end time.
-	initiallyBlockedByPredecessor bool
 
 	// If non-nil, the transforming outgoing dependency from this ElementarySpan.
 	newOutgoingDependency dependencyTransformer[T, CP, SP, DP]
@@ -55,19 +47,28 @@ type transformingElementarySpan[T any, CP, SP, DP fmt.Stringer] struct {
 	// predecessor) that must be resolved before this ElementarySpan is ready to
 	// schedule.
 	pendingIncomingDependencies int
+	// If nonblockingOriginalDependenciesMayShrink is true, the offset from the
+	// non-blocking incoming dependency's origin time to which it may shrink.
+	nonblockingOriginalDependenciesShrinkStartOffset float64
+	// The initial duration (as from trace.Comparator.Diff(start, end)) of the
+	// ElementarySpan.
+	initialDuration float64
+
+	// True if 'new' has its start time set.
+	hasNewStart bool
 	// If true, this ElementarySpan has a predecessor within its Span.
 	hasPredecessor bool
 	// If true, and if this ElementarySpan's incoming dependency is originally
 	// nonblocking and is unmodified, its incoming dependency may shrink.
 	nonblockingOriginalDependenciesMayShrink bool
-	// If nonblockingOriginalDependenciesMayShrink is true, the offset from the
-	// non-blocking incoming dependency's origin time to which it may shrink.
-	nonblockingOriginalDependenciesShrinkStartOffset float64
+	// If true, this elementary span was initially blocked by its predecessor:
+	// its start time equaled its predecessor's end time.
+	initiallyBlockedByPredecessor bool
 }
 
 // Creates and returns a new transforming ElementarySpan
 func newTransformingElementarySpan[T any, CP, SP, DP fmt.Stringer](
-	tt traceTransformer[T, CP, SP, DP],
+	st spanTransformer[T, CP, SP, DP],
 	predecessor elementarySpanTransformer[T, CP, SP, DP],
 	parent spanTransformer[T, CP, SP, DP],
 	initialStart T,
@@ -81,7 +82,7 @@ func newTransformingElementarySpan[T any, CP, SP, DP fmt.Stringer](
 		predES = predecessor.getTransformed()
 	}
 	ret := &transformingElementarySpan[T, CP, SP, DP]{
-		tt:                                       tt,
+		spanTransformer:                          st,
 		newElementarySpan:                        trace.NewMutableElementarySpan(predES),
 		initialStart:                             initialStart,
 		initialDuration:                          duration,
@@ -96,6 +97,10 @@ func newTransformingElementarySpan[T any, CP, SP, DP fmt.Stringer](
 		predecessor.(*transformingElementarySpan[T, CP, SP, DP]).setSuccessor(ret)
 	}
 	return ret
+}
+
+func (tes *transformingElementarySpan[T, CP, SP, DP]) hasOutgoingDep() bool {
+	return tes.newElementarySpan.Outgoing() != nil
 }
 
 func (tes *transformingElementarySpan[T, CP, SP, DP]) getTransformed() trace.MutableElementarySpan[T, CP, SP, DP] {
@@ -123,7 +128,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) originalParent() trace.Spa
 }
 
 func (tes *transformingElementarySpan[T, CP, SP, DP]) updateStart(startAt T) {
-	if !tes.hasNewStart || tes.tt.comparator().Diff(startAt, tes.newElementarySpan.Start()) > 0 {
+	if !tes.hasNewStart || tes.spanTransformer.traceTransformer().comparator().Diff(startAt, tes.newElementarySpan.Start()) > 0 {
 		tes.hasNewStart = true
 		tes.newElementarySpan.WithStart(startAt)
 	}
@@ -161,7 +166,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) resolveUnmodifiedIncomingD
 	// Otherwise, allow the incoming dependency to shrink up to its ready time
 	// plus the shrink offset
 	tes.resolveIncomingDependencyAt(
-		tes.tt.comparator().Add(readyAt, tes.nonblockingOriginalDependenciesShrinkStartOffset),
+		tes.spanTransformer.traceTransformer().comparator().Add(readyAt, tes.nonblockingOriginalDependenciesShrinkStartOffset),
 	)
 }
 
@@ -171,7 +176,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) resolveIncomingDependencyA
 	tes.updateStart(resolvedAt)
 	tes.pendingIncomingDependencies--
 	if tes.pendingIncomingDependencies == 0 {
-		tes.tt.schedule(tes)
+		tes.spanTransformer.traceTransformer().schedule(tes)
 	}
 }
 
@@ -186,14 +191,14 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) finalizeEndpoint() error {
 	for _, spanModification := range tes.newParent.spanModifications() {
 		if spanModification.hasDurationScalingFactor {
 			if scalingFactorChanged {
-				return fmt.Errorf("multiple scaling factors applied to span %s", tes.tt.namer().SpanName(tes.originalParent()))
+				return fmt.Errorf("multiple scaling factors applied to span %s", tes.spanTransformer.traceTransformer().namer().SpanName(tes.originalParent()))
 			}
 			scalingFactor = spanModification.durationScalingFactor
 			scalingFactorChanged = true
 		}
 	}
 	esDur := tes.initialDuration * scalingFactor
-	tes.newElementarySpan.WithEnd(tes.tt.comparator().Add(tes.newElementarySpan.Start(), esDur))
+	tes.newElementarySpan.WithEnd(tes.spanTransformer.traceTransformer().comparator().Add(tes.newElementarySpan.Start(), esDur))
 	return nil
 }
 
@@ -212,13 +217,13 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) schedule() error {
 			// Force the destination's spanTransformer (and therefore the destination
 			// elementarySpanTransformer, and therefore dest.new) to be created, if
 			// it hasn't already.
-			if _, err := tes.tt.spanFromOriginal(dest.original.Span()); err != nil {
+			if _, err := tes.spanTransformer.traceTransformer().spanFromOriginal(dest.original.Span()); err != nil {
 				return err
 			}
 			if dest.new == nil {
 				return fmt.Errorf("outgoing dependency has no new destination ElementarySpan")
 			}
-			newDuration := tes.tt.comparator().Diff(
+			newDuration := tes.spanTransformer.traceTransformer().comparator().Diff(
 				dest.original.Start(),
 				outgoing.original().Origin().End(),
 			)
@@ -235,7 +240,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) schedule() error {
 				}
 			}
 			dest.new.(*transformingElementarySpan[T, CP, SP, DP]).resolveIncomingDependencyAt(
-				tes.tt.comparator().Add(tes.newElementarySpan.End(), newDuration),
+				tes.spanTransformer.traceTransformer().comparator().Add(tes.newElementarySpan.End(), newDuration),
 			)
 		}
 	} else if tes.addedOutgoingDependency != nil {
@@ -244,7 +249,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) schedule() error {
 		// modifying transforms.
 		for _, newDest := range tes.addedOutgoingDependency.destinationsByOriginalSpan {
 			newDest.(*transformingElementarySpan[T, CP, SP, DP]).resolveIncomingDependencyAt(
-				tes.tt.comparator().Add(tes.newElementarySpan.End(), tes.addedOutgoingDependency.adt.schedulingDelay),
+				tes.spanTransformer.traceTransformer().comparator().Add(tes.newElementarySpan.End(), tes.addedOutgoingDependency.adt.schedulingDelay),
 			)
 		}
 	}
@@ -257,14 +262,15 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) schedule() error {
 	return nil
 }
 
+func (tes *transformingElementarySpan[T, CP, SP, DP]) start() T {
+	return tes.initialStart
+}
+
 func (tes *transformingElementarySpan[T, CP, SP, DP]) setOriginalOutgoingDependency(
 	originalOutgoing trace.Dependency[T, CP, SP, DP],
 ) error {
-	transformingOutgoing := tes.tt.dependencyFromOriginal(originalOutgoing)
+	transformingOutgoing := tes.spanTransformer.traceTransformer().dependencyFromOriginal(originalOutgoing)
 	if transformingOutgoing != nil {
-		if tes.newElementarySpan.Outgoing() != nil {
-			return fmt.Errorf("can't set original outgoing dependency for ElementarySpan: it already has one (%v)", tes.newElementarySpan.Outgoing())
-		}
 		tes.newOutgoingDependency = transformingOutgoing
 		if err := transformingOutgoing.setOrigin(tes); err != nil {
 			return err
@@ -277,7 +283,7 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) setOriginalIncomingDepende
 	original trace.ElementarySpan[T, CP, SP, DP],
 	originalIncoming trace.Dependency[T, CP, SP, DP],
 ) error {
-	transformingIncoming := tes.tt.dependencyFromOriginal(originalIncoming)
+	transformingIncoming := tes.spanTransformer.traceTransformer().dependencyFromOriginal(originalIncoming)
 	// The entire incoming dependency may have been deleted, or if it still
 	// exists, this destination may have been deleted.
 	if transformingIncoming != nil &&
@@ -322,6 +328,6 @@ func (tes *transformingElementarySpan[T, CP, SP, DP]) allIncomingDependenciesAdd
 	// ready to schedule at the same point as its original counterpart started.
 	if tes.pendingIncomingDependencies == 0 {
 		tes.updateStart(tes.initialStart)
-		tes.tt.schedule(tes)
+		tes.spanTransformer.traceTransformer().schedule(tes)
 	}
 }

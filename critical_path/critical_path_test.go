@@ -48,13 +48,11 @@ func getEndpoint(
 	spanPathStr string,
 	at time.Duration,
 ) (*Endpoint[time.Duration, tt.StringPayload, tt.StringPayload, tt.StringPayload], error) {
-	matchers, err := tt.PathMatchersFromPattern([]string{spanPathStr})
+	sf, err := tt.SpanFinderFromPattern([]string{spanPathStr})
 	if err != nil {
 		return nil, err
 	}
-	spans := trace.FindSpans[time.Duration, tt.StringPayload, tt.StringPayload, tt.StringPayload](
-		t, t.DefaultNamer(), matchers,
-	)
+	spans := sf.Find(t)
 	if len(spans) != 1 {
 		return nil, fmt.Errorf("exactly one span must match the path pattern '%s' (got %d)", spanPathStr, len(spans))
 	}
@@ -182,7 +180,7 @@ a: 50ns-100ns`,
 			if err != nil {
 				t.Fatalf("Failed to find specified to point: %v", err)
 			}
-			cp, err := Find(
+			cp, err := FindBetweenEndpoints(
 				trace.DurationComparator,
 				test.strategy,
 				from, to,

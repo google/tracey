@@ -124,7 +124,7 @@ func (t *trace[T, CP, SP, DP]) NewRootSpan(start, end T, payload SP) RootSpan[T,
 		parentCategoriesByHierarchyType: map[HierarchyType]Category[T, CP, SP, DP]{},
 	}
 	t.rootSpans = append(t.rootSpans, ret)
-	ret.elementarySpans = append(ret.elementarySpans, makeInitialElementarySpan(ret))
+	ret.elementarySpans = append(ret.elementarySpans, makeInitialElementarySpan[T, CP, SP, DP](ret))
 	return ret
 }
 
@@ -619,7 +619,7 @@ func (cs *commonSpan[T, CP, SP, DP]) newChildSpan(
 	child := &nonRootSpan[T, CP, SP, DP]{
 		commonSpan: newCommonSpan[T, CP, SP, DP](start, end, payload),
 	}
-	child.elementarySpans = append(child.elementarySpans, makeInitialElementarySpan(child))
+	child.elementarySpans = append(child.elementarySpans, makeInitialElementarySpan[T, CP, SP, DP](child))
 	call := &dependency[T, CP, SP, DP]{
 		dependencyType: Call,
 	}

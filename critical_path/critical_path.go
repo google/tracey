@@ -63,6 +63,29 @@ type Endpoint[T any, CP, SP, DP fmt.Stringer] struct {
 	At   T
 }
 
+// ElementarySpan returns the ElementarySpan in which the provided Endpoint
+// lies, using the provided Comparator.
+func (e *Endpoint[T, CP, SP, DP]) ElementarySpan(
+	comparator trace.Comparator[T],
+) trace.ElementarySpan[T, CP, SP, DP] {
+	if e == nil {
+		return nil
+	}
+	ess := e.Span.ElementarySpans()
+	// Find the index of the first span ending at or after the specified point.
+	idx := sort.Search(len(ess), func(x int) bool {
+		return comparator.LessOrEqual(e.At, ess[x].End())
+	})
+	if idx == len(ess) {
+		return nil
+	}
+	es := ess[idx]
+	if comparator.LessOrEqual(es.Start(), e.At) {
+		return es
+	}
+	return nil
+}
+
 // Strategy specifies a particular critical path selection strategy.
 type Strategy int
 
@@ -94,38 +117,55 @@ const (
 	PreferLeastWork
 )
 
-// elementarySpanAt returns the ElementarySpan in which the provided Endpoint
-// lies, using the provided Comparator.
-func elementarySpanAt[T any, CP, SP, DP fmt.Stringer](
-	comparator trace.Comparator[T],
-	endpoint *Endpoint[T, CP, SP, DP],
-) (trace.ElementarySpan[T, CP, SP, DP], bool) {
-	ess := endpoint.Span.ElementarySpans()
-	// Find the index of the first span ending at or after the specified point.
-	idx := sort.Search(len(ess), func(x int) bool {
-		return comparator.LessOrEqual(endpoint.At, ess[x].End())
-	})
-	if idx == len(ess) {
-		return nil, false
-	}
-	es := ess[idx]
-	if comparator.LessOrEqual(es.Start(), endpoint.At) {
-		return es, true
-	}
-	return nil, false
+// StrategyNames maps critical path strategies to their names.
+var StrategyNames = map[Strategy]string{
+	PreferCausal:         "Prefer traversing causal dependencies",
+	PreferPredecessor:    "Prefer traversing sequential dependencies",
+	PreferMostProximate:  "Traverse latest-resolving dependencies",
+	PreferLeastProximate: "Traverse earliest-resolving dependencies",
+	PreferMostWork:       "Maximize work (can be slow!)",
+	PreferLeastWork:      "Maximize dependency delay (can be slow!)",
 }
 
-// Find seeks a critical path between the two specified endpoints.
-func Find[T any, CP, SP, DP fmt.Stringer](
+// StrategiesByName maps critical path strategy names to the strategies.
+var StrategiesByName = map[string]Strategy{
+	StrategyNames[PreferCausal]:         PreferCausal,
+	StrategyNames[PreferPredecessor]:    PreferPredecessor,
+	StrategyNames[PreferMostProximate]:  PreferMostProximate,
+	StrategyNames[PreferLeastProximate]: PreferLeastProximate,
+	StrategyNames[PreferMostWork]:       PreferMostWork,
+	StrategyNames[PreferLeastWork]:      PreferLeastWork,
+}
+
+// FindBetweenEndpoints seeks a critical path between the two specified endpoints.
+func FindBetweenEndpoints[T any, CP, SP, DP fmt.Stringer](
 	comparator trace.Comparator[T],
 	strategy Strategy,
 	from, to *Endpoint[T, CP, SP, DP],
 ) ([]trace.ElementarySpan[T, CP, SP, DP], error) {
+	origin := from.ElementarySpan(comparator)
+	if origin == nil {
+		return nil, fmt.Errorf("can't find critical path: origin span is not running at start point %v", from.At)
+	}
+	destination := to.ElementarySpan(comparator)
+	if destination == nil {
+		return nil, fmt.Errorf("can't find critical path: destination span is not running at start point %v", from.At)
+	}
+	return FindBetweenElementarySpans(comparator, strategy, origin, destination)
+}
+
+// FindBetweenElementarySpans seeks a critical path between the two specified
+// ElementarySpans.
+func FindBetweenElementarySpans[T any, CP, SP, DP fmt.Stringer](
+	comparator trace.Comparator[T],
+	strategy Strategy,
+	origin, destination trace.ElementarySpan[T, CP, SP, DP],
+) ([]trace.ElementarySpan[T, CP, SP, DP], error) {
 	switch strategy {
 	case PreferCausal, PreferPredecessor, PreferMostProximate, PreferLeastProximate:
-		return greedyFind[T, CP, SP, DP](comparator, strategy, from, to)
+		return greedyFind[T, CP, SP, DP](comparator, strategy, origin, destination)
 	case PreferMostWork, PreferLeastWork:
-		return exactFind[T, CP, SP, DP](comparator, strategy, from, to)
+		return exactFind[T, CP, SP, DP](comparator, strategy, origin, destination)
 	default:
 		return nil, fmt.Errorf("unsupported critical path strategy")
 	}
@@ -139,7 +179,7 @@ func Find[T any, CP, SP, DP fmt.Stringer](
 func greedyFind[T any, CP, SP, DP fmt.Stringer](
 	comparator trace.Comparator[T],
 	strategy Strategy,
-	from, to *Endpoint[T, CP, SP, DP],
+	origin, destination trace.ElementarySpan[T, CP, SP, DP],
 ) ([]trace.ElementarySpan[T, CP, SP, DP], error) {
 	// A step in the critical path search.
 	type step struct {
@@ -153,14 +193,6 @@ func greedyFind[T any, CP, SP, DP fmt.Stringer](
 	// better critical path, so all visits after the first are immediately
 	// pruned.
 	visitedEvents := map[trace.ElementarySpan[T, CP, SP, DP]]struct{}{}
-	origin, ok := elementarySpanAt(comparator, from)
-	if !ok {
-		return nil, fmt.Errorf("can't find critical path: origin span is not running at start point %v", from.At)
-	}
-	destination, ok := elementarySpanAt(comparator, to)
-	if !ok {
-		return nil, fmt.Errorf("can't find critical path: destination span is not running at start point %v", from.At)
-	}
 	// Always start the backwards search at `to`.
 	steps := []step{{destination, -1}}
 	// Initialize the stack with the `to` step.
@@ -322,16 +354,8 @@ func findReachable[T any, CP, SP, DP fmt.Stringer](
 func exactFind[T any, CP, SP, DP fmt.Stringer](
 	comparator trace.Comparator[T],
 	strategy Strategy,
-	from, to *Endpoint[T, CP, SP, DP],
+	origin, destination trace.ElementarySpan[T, CP, SP, DP],
 ) ([]trace.ElementarySpan[T, CP, SP, DP], error) {
-	origin, ok := elementarySpanAt(comparator, from)
-	if !ok {
-		return nil, fmt.Errorf("can't find critical path: origin span is not running at start point %v", from.At)
-	}
-	destination, ok := elementarySpanAt(comparator, to)
-	if !ok {
-		return nil, fmt.Errorf("can't find critical path: destination span is not running at start point %v", from.At)
-	}
 	// Find all ElementarySpan lying on any path between 'from' and 'to'.
 	backwardsSweep := findReachable(comparator, backwards, origin, destination, nil)
 	onPath := findReachable(comparator, forwards, origin, destination, backwardsSweep)
@@ -443,7 +467,7 @@ func exactFind[T any, CP, SP, DP fmt.Stringer](
 		// critical path formally unsolvable, but we can resolve the earliest
 		// unvisited ESs to try to break the cycle.
 		if len(queue) == 0 && count != len(onPath) {
-			fmt.Printf("Cycle exists along possible critical paths; attempting to resolve")
+			fmt.Printf("Warning: Cycle exists along possible critical paths; attempting to resolve\n")
 			earliestUnvisited := []*esState{}
 			for _, ess := range statesByES {
 				if !ess.visited {

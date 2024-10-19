@@ -100,9 +100,9 @@ import (
 // A trace-independent specification for a particular dependency transform
 // (i.e., changing dependency scheduling time.)
 type modifyDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP]
-	matchingDependencyTypes                     []trace.DependencyType
-	durationScalingFactor                       float64
+	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP]
+	matchingDependencyTypes                 []trace.DependencyType
+	durationScalingFactor                   float64
 
 	mayShrinkIfNotOriginallyBlocking bool
 	mayShrinkToOriginOffset          float64
@@ -117,13 +117,12 @@ type appliedDependencyModifications[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular span transform
 // (i.e., changing span start time or duration.)
 type modifySpanTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	spanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP]
+	spanFinder *trace.SpanFinder[T, CP, SP, DP]
 
 	hasDurationScalingFactor bool
 	durationScalingFactor    float64
 
-	hasNewStart bool
-	newStart    T
+	startsAsEarlyAsPossible bool
 }
 
 // A modified-Span transform applied to a particular Trace.
@@ -135,15 +134,12 @@ type appliedSpanModifications[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular added-dependency
 // transform.
 type addDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP]
-	dependencyType                              trace.DependencyType
+	originPosition, destinationPosition *trace.Position[T, CP, SP, DP]
+	dependencyType                      trace.DependencyType
 	// The scheduling delay of the added dependency.  Should be the output of
 	// Comparator[T].Diff().
 	schedulingDelay float64
 	// The percentage through the origin at which the dependency originates.
-	percentageThroughOrigin float64
-	// The percentage through the destination at which the dependency terminates.
-	percentageThroughDestination float64
 }
 
 // An added-Dependency transform applied to a particular Trace.
@@ -158,8 +154,8 @@ type appliedDependencyAdditions[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular removed-dependency
 // transform.
 type removeDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originSpanMatchers, destinationSpanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP]
-	matchingDependencyTypes                     []trace.DependencyType
+	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP]
+	matchingDependencyTypes                 []trace.DependencyType
 }
 
 // A removed-Depenency transform applied to a particular Trace.
@@ -184,7 +180,7 @@ type SpanGater[T any, CP, SP, DP fmt.Stringer] interface {
 
 // A trace-independent specification for a particular gated-span transform.
 type gatedSpanTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	spanMatchers [][]trace.PathElementMatcher[T, CP, SP, DP]
+	spanFinder *trace.SpanFinder[T, CP, SP, DP]
 
 	spanGaterFn func() SpanGater[T, CP, SP, DP]
 }
@@ -202,10 +198,11 @@ type appliedTransforms[T any, CP, SP, DP fmt.Stringer] struct {
 	appliedSpanModifications       []*appliedSpanModifications[T, CP, SP, DP]
 	appliedSpanGates               []*appliedSpanGates[T, CP, SP, DP]
 	appliedDependencyModifications []*appliedDependencyModifications[T, CP, SP, DP]
-	appliedDependencyAdditions     []*appliedDependencyAdditions[T, CP, SP, DP]
-	appliedDependencyRemovals      []*appliedDependencyRemovals[T, CP, SP, DP]
-	categoryPayloadMapping         func(original, new trace.Category[T, CP, SP, DP]) CP
-	spanPayloadMapping             func(original, new trace.Span[T, CP, SP, DP]) SP
+	// If nil, the added dependency is inapplicable to the trace.
+	appliedDependencyAdditions []*appliedDependencyAdditions[T, CP, SP, DP]
+	appliedDependencyRemovals  []*appliedDependencyRemovals[T, CP, SP, DP]
+	categoryPayloadMapping     func(original, new trace.Category[T, CP, SP, DP]) CP
+	spanPayloadMapping         func(original, new trace.Span[T, CP, SP, DP]) SP
 }
 
 // An added Dependency in the transforming Trace.
@@ -280,14 +277,18 @@ type elementarySpanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	// Sets the ElementarySpan's incoming dependency following the provided
 	// Dependency addition.
 	setNewIncomingDependency(incomingADA *appliedDependencyAdditions[T, CP, SP, DP]) error
+	hasOutgoingDep() bool
 	// Schedules the ElementarySpan, resolving its end time and all of its
 	// outgoing Dependencies.
 	schedule() error
+	// Returns the initial start time of the ElementarySpan.
+	start() T
 }
 
 // The external interface of a transformingSpan -- a Span in the process of
 // being transformed.
 type spanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
+	traceTransformer() traceTransformer[T, CP, SP, DP]
 	// Returns the original Span.
 	original() trace.Span[T, CP, SP, DP]
 	// Returns the Span's ElementarySpans.
@@ -301,6 +302,8 @@ type spanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 type traceTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	// Returns a Comparator suitable for the trace being transformed.
 	comparator() trace.Comparator[T]
+	// Returns the earliest moment in the original trace.
+	start() T
 	// Returns a Namer for the trace being transformed.
 	namer() trace.Namer[T, CP, SP, DP]
 	// Returns the set of transformations to be applied.

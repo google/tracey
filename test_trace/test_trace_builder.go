@@ -18,6 +18,7 @@ package testtrace
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,18 +100,12 @@ func (stn *stringTraceNamer) SpanUniqueID(
 	return span.Payload().String()
 }
 
-func (stn *stringTraceNamer) HierarchyTypeName(ht trace.HierarchyType) string {
-	if ret, ok := HierarchyTypeNames[ht]; ok {
-		return ret
-	}
-	return "unknown"
+func (stn *stringTraceNamer) HierarchyTypeNames() map[trace.HierarchyType]string {
+	return HierarchyTypeNames
 }
 
-func (stn *stringTraceNamer) DependencyTypeName(dt trace.DependencyType) string {
-	if ret, ok := DependencyTypeNames[dt]; ok {
-		return ret
-	}
-	return "unknown"
+func (stn *stringTraceNamer) DependencyTypeNames() map[trace.DependencyType]string {
+	return DependencyTypeNames
 }
 
 func (stn *stringTraceNamer) MomentString(t time.Duration) string {
@@ -208,20 +203,24 @@ func (tb *TraceBuilder) WithDependency(
 	return tb
 }
 
+func (tb *TraceBuilder) findSpans(
+	pathMatchers []string,
+) []trace.Span[time.Duration, StringPayload, StringPayload, StringPayload] {
+	sf, err := SpanFinderFromPattern(pathMatchers)
+	if err != nil {
+		tb.err(err)
+		return nil
+	}
+	return sf.Find(tb.trace)
+}
+
 // WithSuspend adds a suspend over the specified interval in the specified
 // span.
 func (tb *TraceBuilder) WithSuspend(
 	pathMatchers []string, start, end time.Duration,
 	opts ...trace.SuspendOption,
 ) *TraceBuilder {
-	matchers, err := PathMatchersFromPattern(pathMatchers)
-	if err != nil {
-		tb.err(err)
-		return tb
-	}
-	spans := trace.FindSpans[time.Duration, StringPayload, StringPayload, StringPayload](
-		tb.trace, tb.trace.DefaultNamer(), matchers,
-	)
+	spans := tb.findSpans(pathMatchers)
 	if len(spans) != 1 {
 		tb.err(fmt.Errorf("exactly one span must match the path patterns '%v' (got %d)", pathMatchers, len(spans)))
 		return tb
@@ -241,13 +240,7 @@ func Origin(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		matchers, err := PathMatchersFromPattern(pathMatchers)
-		if err != nil {
-			return err
-		}
-		spans := trace.FindSpans[time.Duration, StringPayload, StringPayload, StringPayload](
-			tb.trace, tb.trace.DefaultNamer(), matchers,
-		)
+		spans := tb.findSpans(pathMatchers)
 		if len(spans) != 1 {
 			return fmt.Errorf("exactly one span must match the path patterns '%v' (got %d)", pathMatchers, len(spans))
 		}
@@ -266,13 +259,7 @@ func Destination(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		matchers, err := PathMatchersFromPattern(pathMatchers)
-		if err != nil {
-			return err
-		}
-		spans := trace.FindSpans[time.Duration, StringPayload, StringPayload, StringPayload](
-			tb.trace, tb.trace.DefaultNamer(), matchers,
-		)
+		spans := tb.findSpans(pathMatchers)
 		if len(spans) != 1 {
 			return fmt.Errorf("exactly one span must match the path pattern '%v' (got %d)", pathMatchers, len(spans))
 		}
@@ -291,13 +278,7 @@ func DestinationAfterWait(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		matchers, err := PathMatchersFromPattern(pathMatchers)
-		if err != nil {
-			return err
-		}
-		spans := trace.FindSpans[time.Duration, StringPayload, StringPayload, StringPayload](
-			tb.trace, tb.trace.DefaultNamer(), matchers,
-		)
+		spans := tb.findSpans(pathMatchers)
 		if len(spans) != 1 {
 			return fmt.Errorf("exactly one span must match the path pattern '%v' (got %d)", pathMatchers, len(spans))
 		}
@@ -370,26 +351,18 @@ type RootSpanFn func(tb *TraceBuilder) (
 	error,
 )
 
-// PathMatchersFromPattern returns a slice of PathElementMatchers formed by
+// SpanFinderFromPattern returns a slice of PathElementMatchers formed by
 // splitting the provided path string on slashes, then creating a
 // LiteralNameMatcher for each path element.
-func PathMatchersFromPattern(pathMatchers []string) (
-	[][]trace.PathElementMatcher[time.Duration, StringPayload, StringPayload, StringPayload],
+func SpanFinderFromPattern(spanFinderStrs []string) (
+	*trace.SpanFinder[time.Duration, StringPayload, StringPayload, StringPayload],
 	error,
 ) {
 	pmp, err := trace.NewPathMatcherParser[time.Duration, StringPayload, StringPayload, StringPayload]()
 	if err != nil {
 		return nil, err
 	}
-	ret := make([][]trace.PathElementMatcher[time.Duration, StringPayload, StringPayload, StringPayload], len(pathMatchers))
-	for idx, pathMatcher := range pathMatchers {
-		pems, err := pmp.ParsePathMatcherStr(pathMatcher)
-		if err != nil {
-			return nil, err
-		}
-		ret[idx] = pems
-	}
-	return ret, nil
+	return pmp.ParseSpanFinderStr(&stringTraceNamer{}, trace.SpanOnlyHierarchyType, strings.Join(spanFinderStrs, ","))
 }
 
 // RootSpan defines a root Span, with the specified endpoints, payload,

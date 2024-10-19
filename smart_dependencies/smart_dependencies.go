@@ -217,34 +217,35 @@ func PrettyPrintMetrics[T any, CP, SP, DP fmt.Stringer](
 	indent string,
 ) string {
 	ret := []string{}
+	dependencyTypes := namer.DependencyTypeNames()
 	if len(m.UnpairedOriginsByType) > 0 {
 		ret = append(ret, indent+"Unpaired origins by type:")
 		for dt, count := range m.UnpairedOriginsByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, namer.DependencyTypeName(dt), count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
 		}
 	}
 	if len(m.UnpairedDestinationsByType) > 0 {
 		ret = append(ret, indent+"Unpaired destinations by type:")
 		for dt, count := range m.UnpairedDestinationsByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, namer.DependencyTypeName(dt), count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
 		}
 	}
 	if len(m.PairedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Paired dependencies by type:")
 		for dt, count := range m.PairedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, namer.DependencyTypeName(dt), count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
 		}
 	}
 	if len(m.CreatedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Created dependencies by type:")
 		for dt, count := range m.CreatedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, namer.DependencyTypeName(dt), count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
 		}
 	}
 	if len(m.DroppedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Dropped dependencies by type:")
 		for dt, count := range m.DroppedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, namer.DependencyTypeName(dt), count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
 		}
 	}
 	return strings.Join(ret, "\n")
