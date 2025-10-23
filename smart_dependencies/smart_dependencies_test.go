@@ -17,17 +17,20 @@
 package smartdependencies
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/tracey/test_trace"
 	"github.com/google/tracey/trace"
-	"github.com/google/go-cmp/cmp"
+	traceparser "github.com/google/tracey/trace/parser"
 )
 
-func spanFinder(t *testing.T, strs ...string) *trace.SpanFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
+func spanFinderPattern(t *testing.T, strs ...string) *traceparser.SpanPattern {
 	t.Helper()
-	ret, err := testtrace.SpanFinderFromPattern(strs)
+	ret, err := traceparser.ParseSpanSpecifierPatterns(trace.SpanOnlyHierarchyType, strings.Join(strs, "/"))
 	if err != nil {
 		t.Fatalf("failed to build path matchers: %s", err)
 	}
@@ -63,7 +66,7 @@ func TestSmartDependencies(t *testing.T) {
 		wantSDErr     bool
 		hierarchyType trace.HierarchyType
 		wantTraceStr  string
-		wantMetrics   *Metrics // metrics not collected if nil
+		wantMetrics   *Metrics[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] // metrics not collected if nil
 	}{{
 		description: "deps without origins are dropped",
 		buildTrace:  abTrace,
@@ -76,10 +79,11 @@ func TestSmartDependencies(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
-			noOrigin.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				100,
-			)
+			sf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "b"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			noOrigin.WithDestination(sf.FindSpans()[0], 100)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -102,10 +106,11 @@ Trace spans:
 			if err != nil {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
-			noDestination.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				100,
-			)
+			sf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "a"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			noDestination.WithOrigin(sf.FindSpans()[0], 100)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -125,10 +130,11 @@ Trace spans:
 			sds *SmartDependencies[string, time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 		) {
 			noOrigin := sds.NewUnindexed(testtrace.Send, "", KeepDependenciesWithoutOriginsOrDestinations)
-			noOrigin.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				50,
-			)
+			sf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "b"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			noOrigin.WithDestination(sf.FindSpans()[0], 50)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -149,10 +155,11 @@ Trace spans:
 			sds *SmartDependencies[string, time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 		) {
 			noDestination := sds.NewUnindexed(testtrace.Send, "", KeepDependenciesWithoutOriginsOrDestinations)
-			noDestination.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				100,
-			)
+			sf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "a"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			noDestination.WithOrigin(sf.FindSpans()[0], 100)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -163,7 +170,7 @@ Trace spans:
   Span 'b' (0s-100ns) (b)
     Elementary spans:
       0s-100ns <none> -> THIS -> <none>`,
-		wantMetrics: newMetrics().
+		wantMetrics: newMetrics(testtrace.TestNamer).
 			withCreatedDependencies(testtrace.Send, 1),
 	}, {
 		description: "smart dep is created",
@@ -177,14 +184,16 @@ Trace spans:
 			if err != nil {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				50,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				50,
-			)
+			asf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "a"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			bsf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "b"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			dep.WithOrigin(asf.FindSpans()[0], 50)
+			dep.WithDestination(bsf.FindSpans()[0], 50)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -209,34 +218,21 @@ Trace spans:
 			if err != nil {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				10,
-			)
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				30,
-			)
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				60,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				5,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				20,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				40,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				50,
-			)
+			asf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "a"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			bsf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "b"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			dep.WithOrigin(asf.FindSpans()[0], 10)
+			dep.WithOrigin(asf.FindSpans()[0], 30)
+			dep.WithOrigin(asf.FindSpans()[0], 60)
+			dep.WithDestination(bsf.FindSpans()[0], 5)
+			dep.WithDestination(bsf.FindSpans()[0], 20)
+			dep.WithDestination(bsf.FindSpans()[0], 40)
+			dep.WithDestination(bsf.FindSpans()[0], 50)
 		},
 		wantSDErr:     true,
 		hierarchyType: testtrace.None,
@@ -260,34 +256,21 @@ Trace spans:
 			if err != nil {
 				t.Fatalf("failed to get indexed dependency: %s", err.Error())
 			}
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				10,
-			)
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				30,
-			)
-			dep.WithOrigin(
-				spanFinder(t, "a").Find(tr)[0],
-				60,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				5,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				20,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				40,
-			)
-			dep.WithDestination(
-				spanFinder(t, "b").Find(tr)[0],
-				50,
-			)
+			asf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "a"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			bsf, err := traceparser.NewSpanFinder(spanFinderPattern(t, "b"), tr)
+			if err != nil {
+				t.Fatalf("failed to parse span finder: %v", err)
+			}
+			dep.WithOrigin(asf.FindSpans()[0], 10)
+			dep.WithOrigin(asf.FindSpans()[0], 30)
+			dep.WithOrigin(asf.FindSpans()[0], 60)
+			dep.WithDestination(bsf.FindSpans()[0], 5)
+			dep.WithDestination(bsf.FindSpans()[0], 20)
+			dep.WithDestination(bsf.FindSpans()[0], 40)
+			dep.WithDestination(bsf.FindSpans()[0], 50)
 		},
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
@@ -303,7 +286,7 @@ Trace spans:
       20ns-40ns [send from a @10ns] -> THIS -> <none>
       40ns-50ns [send from a @30ns] -> THIS -> <none>
       50ns-100ns [send from a @30ns] -> THIS -> <none>`,
-		wantMetrics: newMetrics().
+		wantMetrics: newMetrics(testtrace.TestNamer).
 			withUnpairedOrigins(testtrace.Send, 1).      // @60
 			withUnpairedDestinations(testtrace.Send, 1). // @5
 			withCreatedDependencies(testtrace.Send, 2).
@@ -315,7 +298,7 @@ Trace spans:
 			sds := New[string](trace)
 			test.attachDeps(t, trace, sds)
 			var sdErr error
-			var gotMetrics *Metrics
+			var gotMetrics *Metrics[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]
 			if test.wantMetrics == nil {
 				sdErr = sds.Close()
 			} else {
@@ -327,8 +310,12 @@ Trace spans:
 			if sdErr != nil {
 				return
 			}
+			ignoreNamer := cmpopts.IgnoreFields(
+				Metrics[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{},
+				"namer",
+			)
 			if test.wantMetrics != nil {
-				if diff := cmp.Diff(test.wantMetrics, gotMetrics); diff != "" {
+				if diff := cmp.Diff(test.wantMetrics, gotMetrics, ignoreNamer); diff != "" {
 					t.Fatalf("unexpected closure metrics, diff (-want +got) %s", diff)
 				}
 			}
@@ -338,7 +325,7 @@ Trace spans:
 			} else {
 				gotTraceStr = testtrace.TPP.PrettyPrintTrace(trace, test.hierarchyType)
 			}
-			if diff := cmp.Diff(test.wantTraceStr, gotTraceStr); diff != "" {
+			if diff := cmp.Diff(test.wantTraceStr, gotTraceStr, ignoreNamer); diff != "" {
 				t.Errorf("got trace string\n%s\n, diff (-want +got) %s", gotTraceStr, diff)
 			}
 		})

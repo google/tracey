@@ -1,3 +1,19 @@
+/*
+	Copyright 2025 Google Inc.
+
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at
+
+			http://www.apache.org/licenses/LICENSE-2.0
+
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+*/
+
 // Package trace defines interfaces, types, and functions that facilitate
 // building traces suitable for visualization, analysis, and transformation.
 //
@@ -21,11 +37,16 @@
 // instances.  Different Dependency types are not treated differently in this
 // package, but instead are used to identify and select specific classes of
 // Dependencies, for instance when defining Trace transforms.  A Dependency
-// must have a single origin endpoint -- a particular Span at a particular
-// point within its running duration -- and one or more destination endpoints,
-// and it defines, for each destination endpoint, a causal relationship with
-// the origin endpoint: the destination endpoint cannot occur until the origin
-// endpoint has occurred.  Dependencies are created at the Trace level.
+// must have a single *triggering* origin endpoint -- a particular Span at a
+// particular point within its running duration where the Dependency was
+// causally resolved -- and one or more destination endpoints, and it defines,
+// for each destination endpoint, a causal relationship with the triggering
+// origin endpoint: the destination endpoint cannot occur until the origin
+// endpoint has occurred.  A dependency may have multiple origins, but only one
+// can be *triggering*; the rest are non-triggering.  Non-triggering origins
+// are not considered causal for analysis purposes, but non-triggering origins
+// may become triggering under transformation.  Dependencies are created at the
+// Trace level.
 //
 // Traces may also define hierarchies of Categories into which RootSpans may
 // be placed; when a RootSpan is placed under a Category, all its descendant
@@ -94,6 +115,7 @@
 //     provide storage for Dependency metadata beyond type.  Dependency
 //     payloads must implement fmt.Stringer to enable full Dependency
 //     serialization.
+
 package trace
 
 import (
@@ -178,10 +200,10 @@ type Namer[T any, CP, SP, DP fmt.Stringer] interface {
 	// unique at least among the span's siblings and deterministically
 	// determined.
 	SpanUniqueID(span Span[T, CP, SP, DP]) string
-	// Returns a human-readable name for the provided HierarachyType.
-	HierarchyTypeNames() map[HierarchyType]string
+	// Returns the available HierarchyTypes.
+	HierarchyTypes() *HierarchyTypes
 	// Returns a human-readable name for the provided DependencyType.
-	DependencyTypeNames() map[DependencyType]string
+	DependencyTypes() *DependencyTypes
 	// Returns a human-readable representation of the provided moment.
 	MomentString(t T) string
 }
@@ -215,7 +237,7 @@ type Trace[T any, CP, SP, DP fmt.Stringer] interface {
 	// or, in some cases, an incomplete Dependency might be warranted to show
 	// where traces are lacking information, such as a Dependency on an untraced
 	// RPC.
-	NewDependency(dependencyType DependencyType, payload DP) Dependency[T, CP, SP, DP]
+	NewDependency(dependencyType DependencyType, payload DP, dependencyOptions ...DependencyOption) Dependency[T, CP, SP, DP]
 	// Simplifies the receiver's Spans by merging abutting ElementarySpans and
 	// suspend intervals where no Dependencies intervene.  This optional method
 	// only simplifies the trace, and does not affect the semantics of the trace.
@@ -272,10 +294,17 @@ type SuspendOption uint64
 // Options applied when creating suspends.  May be ORed together.
 const (
 	DefaultSuspendOptions SuspendOption = 0
+)
+
+// Non-default suspend options.
+const (
 	// If present, a suspend may cross ElementarySpan boundaries.  If it does
 	// so, any endpoint it crosses becomes its own zero-duration ElementarySpan,
 	// preserving incoming or outgoing Dependencies.
 	SuspendFissionsAroundElementarySpanEndpoints SuspendOption = 1 << iota
+	// If present, a suspend may cross marks.  If it does so, any mark it crosses
+	// becomes its own zero-duration ElementarySpan.
+	SuspendFissionsAroundMarks
 )
 
 // Span is a temporal element of a trace, whose temporal extent includes its
@@ -291,8 +320,12 @@ type Span[T any, CP, SP, DP fmt.Stringer] interface {
 	Payload() SP
 	// Returns this Span's parent Span, or nil if it is a RootSpan.
 	ParentSpan() Span[T, CP, SP, DP]
+	// Returns the RootSpan ancestral to this span, which may be the receiver.
+	RootSpan() RootSpan[T, CP, SP, DP]
 	// Returns this Span's children.
 	ChildSpans() []Span[T, CP, SP, DP]
+	// Marks the provided span at the specified moment with the provided label.
+	Mark(comparator Comparator[T], label string, moment T, options ...MarkOption) error
 	// Marks this Span as non-running over the specified interval.  Returns an
 	// error if the proposed suspend is incompatible with the provided options.
 	Suspend(comparator Comparator[T], start, end T, options ...SuspendOption) error
@@ -319,6 +352,27 @@ type RootSpan[T any, CP, SP, DP fmt.Stringer] interface {
 	ParentCategory(ht HierarchyType) Category[T, CP, SP, DP]
 }
 
+// Mark represents a labeled position within a trace.
+type Mark[T any] interface {
+	Label() string
+	Moment() T
+}
+
+// MarkOption specifies options applied when creating dependencies.
+type MarkOption uint64
+
+// Options applied when creating dependency endpoints.  May be ORed together.
+const (
+	DefaultMarkOptions MarkOption = 0
+)
+
+// Non-default mark options.
+const (
+	// If present, this mark can fission a preexisting suspend
+	// region.
+	MarkCanFissionSuspend MarkOption = 1 << iota
+)
+
 // ElementarySpan is a temporal portion of a Span during which the Span's view
 // of the rest of the Trace, and the rest of the Trace's view of the Span, is
 // causally unchanged.  ElementarySpans are comparable to compiler basic
@@ -337,6 +391,8 @@ type ElementarySpan[T any, CP, SP, DP fmt.Stringer] interface {
 	timeRange[T]
 	// This ElementarySpan's parent Span.
 	Span() Span[T, CP, SP, DP]
+	// Returns the marks in this ElementarySpan, if any.
+	Marks() []Mark[T]
 	// The ElementarySpan preceding this one in its parent Span.  nil for the
 	// first ElementarySpan within a Span.
 	Predecessor() ElementarySpan[T, CP, SP, DP]
@@ -347,20 +403,78 @@ type ElementarySpan[T any, CP, SP, DP fmt.Stringer] interface {
 	// If non-nil, this ElementarySpan will be among Incoming.Destinations.
 	Incoming() Dependency[T, CP, SP, DP] // nil if none.
 	// The Dependency, if any, at the end of this ElementarySpan.
-	// If non-nil, this ElementarySpan will be Outgoing.Origin().
+	// If non-nil, this ElementarySpan will be in Outgoing.Origins(); if this is
+	// the Dependency's triggering origin, this ElementarySpan will be
+	// Outgoing.TriggeringOrigin().
 	Outgoing() Dependency[T, CP, SP, DP] // nil if none.
 }
 
-// DependencyOption specifies options applied when creating dependencies.
-type DependencyOption uint64
+// DependencyEndpointOption specifies options applied when creating dependencies.
+type DependencyEndpointOption uint64
 
 // Options applied when creating dependency endpoints.  May be ORed together.
 const (
-	DefaultDependencyOptions DependencyOption = 0
+	DefaultDependencyEndpointOptions DependencyEndpointOption = 0
+)
+
+// Non-default dependency endpoint options.
+const (
 	// If present, this dependency endpoint can fission a preexisting suspend
 	// region.
-	DependencyCanFissionSuspend DependencyOption = 1 << iota
+	DependencyEndpointCanFissionSuspend DependencyEndpointOption = 1 << iota
+	// If present, this dependency endpoint should be placed prior to other
+	// previously-added dependency endpoints in the same span at the same time.
+	// Note that the first incoming dependency within a span at a given moment
+	// will always occur before the last outgoing one in that span at that
+	// moment.  Incompatible with PlaceDependencyEndpointAsLateAsPossible.
+	PlaceDependencyEndpointAsEarlyAsPossible
+	// If present this dependency endpoint should be placed after other
+	// previously-added dependency endpoints in the same span at the same time.
+	// Note that the first incoming dependency within a span at a given moment
+	// will always occur before the last outgoing one in that span at that
+	// moment.  Incompatible with PlaceDependencyEndpointAsEarlyAsPossible.
+	PlaceDependencyEndpointAsLateAsPossible
 )
+
+// DependencyOption records dependency options.
+type DependencyOption int
+
+const (
+	// DefaultDependencyOptions is the default set of dependency properties.
+	DefaultDependencyOptions DependencyOption = 0
+)
+
+const (
+	multipleOrigins DependencyOption = 1 << iota
+	andSemantics
+	orSemantics
+)
+
+// Non-default dependency options.
+const (
+	// Indicates that this dependency may have several origins, and those origins
+	// have AND-semantics (meaning that the latest-resolving origin is the causal
+	// trigger).
+	// AND-origin semantics reflect code blocked on all of several events, for
+	// example when code blocks until one file descriptor is readable and another
+	// is writeable.  Noting these semantics allows them to be preserved through
+	// trace transformation.
+	MultipleOriginsWithAndSemantics = multipleOrigins | andSemantics
+	// Indicates that this dependency may have several origins, and those origins
+	// have OR-semantics (meaning that the earliest-resolving origin is the
+	// causal trigger).
+	// OR-origin semantics reflect code blocked on any of several events.  An
+	// example is spawning work whose results will be cached or memoized: such a
+	// memoized result may be consumed in several places, but the work is only
+	// actually performed when its first consumer requests it.  Noting these
+	// semantics allows them to be preserved through trace transformation.
+	MultipleOriginsWithOrSemantics = multipleOrigins | orSemantics
+)
+
+// Includes returns true iff the receiver includes the provided bitmap mask.
+func (do DependencyOption) Includes(props DependencyOption) bool {
+	return do&props == props
+}
 
 // Dependency represents a causal dependency between two or more Spans.  Each
 // Dependency has a type, a single origin (a point within an origin Span), and
@@ -372,9 +486,18 @@ const (
 type Dependency[T any, CP, SP, DP fmt.Stringer] interface {
 	// The type of this Dependency.
 	DependencyType() DependencyType
-	// The origin of this Dependency.  If nil, this Dependency is incomplete.
-	// If non-nil, this Dependency will be Origin.Outgoing().
-	Origin() ElementarySpan[T, CP, SP, DP]
+	// The triggering origin of this Dependency.  If nil, this Dependency is
+	// incomplete.  If non-nil, this Dependency will be
+	// TriggeringOrigin().Outgoing().
+	TriggeringOrigin() ElementarySpan[T, CP, SP, DP]
+	// All possible origins of this Dependency.  A dependency may only have one
+	// *triggering* origin, representing the point in the trace where the
+	// dependency was, causally, fully resolved, and returned by
+	// TriggeringOrigin(). However, there may be other dependency origins which
+	// are not triggering, but may become so under transformation.
+	Origins() []ElementarySpan[T, CP, SP, DP]
+	// Returns this Dependency's Options.
+	Options() DependencyOption
 	// The destinations of this Dependency.  If nil, this Dependency is
 	// incomplete.  If non-nil, this Dependency will be dest.Incoming() for each
 	// dest in Destinations().
@@ -389,9 +512,8 @@ type Dependency[T any, CP, SP, DP fmt.Stringer] interface {
 		comparator Comparator[T],
 		from Span[T, CP, SP, DP],
 		start T,
-		options ...DependencyOption,
+		options ...DependencyEndpointOption,
 	) error
-
 	// Adds a destination Span into the Dependency, possibly adding a new
 	// ElementarySpan in that destination Span starting at the end point.
 	// Returns an error if the specified point does not lie within a running
@@ -400,9 +522,8 @@ type Dependency[T any, CP, SP, DP fmt.Stringer] interface {
 		comparator Comparator[T],
 		to Span[T, CP, SP, DP],
 		end T,
-		options ...DependencyOption,
+		options ...DependencyEndpointOption,
 	) error
-
 	// Adds a destination Span into the Dependency, possibly adding a new
 	// ElementarySpan in that destination Span starting at the end point, and
 	// introducing a suspended interval in the destination Span between the wait
@@ -414,6 +535,6 @@ type Dependency[T any, CP, SP, DP fmt.Stringer] interface {
 		from Span[T, CP, SP, DP],
 		waitFrom,
 		end T,
-		options ...DependencyOption,
+		options ...DependencyEndpointOption,
 	) error
 }

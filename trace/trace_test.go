@@ -18,6 +18,7 @@ package trace
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -61,9 +62,17 @@ func prettyPrintSpan(span Span[time.Duration, payload, payload, payload], includ
 		if includeESPredNum {
 			predNumStr = esPredNumStr(es) + " "
 		}
+		markStr := ""
+		if len(es.Marks()) > 0 {
+			markStrs := make([]string, len(es.Marks()))
+			for idx, m := range es.Marks() {
+				markStrs[idx] = fmt.Sprintf("'%s' @%v", m.Label(), m.Moment())
+			}
+			markStr = " [" + strings.Join(markStrs, ", ") + "]"
+		}
 		spanStrs = append(
 			spanStrs,
-			fmt.Sprintf("%s%s%s-%s%s", predNumStr, incomingStr, es.Start(), es.End(), outgoingStr),
+			fmt.Sprintf("%s%s%s-%s%s%s", predNumStr, incomingStr, es.Start(), es.End(), markStr, outgoingStr),
 		)
 	}
 	ret := []string{
@@ -94,20 +103,14 @@ func (tn *testNamer) SpanUniqueID(span Span[time.Duration, payload, payload, pay
 	return "id:" + span.Payload().String()
 }
 
-func (tn *testNamer) HierarchyTypeNames() map[HierarchyType]string {
-	ret := map[HierarchyType]string{}
-	for i := 0; i < 10; i++ {
-		ret[HierarchyType(i)] = fmt.Sprintf("hierarchy %d", i)
-	}
-	return ret
+func (tn *testNamer) HierarchyTypes() *HierarchyTypes {
+	return NewHierarchyTypes().
+		With(0, "h0", "hierarchy 0")
 }
 
-func (tn *testNamer) DependencyTypeNames() map[DependencyType]string {
-	ret := map[DependencyType]string{}
-	for i := 0; i < 10; i++ {
-		ret[DependencyType(i)] = fmt.Sprintf("hierarchy %d", i)
-	}
-	return ret
+func (tn *testNamer) DependencyTypes() *DependencyTypes {
+	return NewDependencyTypes().
+		With(0, "d0", "dependency 0")
 }
 
 func (tn *testNamer) MomentString(t time.Duration) string {
@@ -164,7 +167,7 @@ func TestElementarySpanBuilding(t *testing.T) {
 		},
 		wantSpanStr: "() [p-] 0s-30ns, [p0] (I1) 30ns-30ns (O0), [p1] 30ns-50ns (O3), [p2] (I2) 50ns-100ns",
 	}, {
-		description: "multiple zero-duration elementary spans",
+		description: "multiple zero-duration elementary spans, later-defined inputs are placed earlier.",
 		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
 			span := trace.NewRootSpan(0, 100, "")
 			if err := trace.NewDependency(0, "").
@@ -193,9 +196,41 @@ func TestElementarySpanBuilding(t *testing.T) {
 			}
 			return span, nil
 		},
-		// Later-defined events will be placed before others of the same direction
-		// (incoming/outgoing) and at the same time.
-		wantSpanStr: "() [p-] 0s-30ns (O2), [p0] 30ns-30ns (O1), [p1] 30ns-30ns (O0), [p2] 30ns-60ns, [p3] (I5) 60ns-60ns, [p4] (I4) 60ns-60ns, [p5] (I3) 60ns-100ns",
+		// Later-defined inputs will be placed before earlier-defined ones.
+		wantSpanStr: "() [p-] 0s-30ns (O0), [p0] 30ns-30ns (O1), [p1] 30ns-30ns (O2), [p2] 30ns-60ns, [p3] (I5) 60ns-60ns, [p4] (I4) 60ns-60ns, [p5] (I3) 60ns-100ns",
+	}, {
+		description: "multiple zero-duration elementary spans, later-defined outputs are placed later, and inputs default before outputs.",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			if err := trace.NewDependency(2, "").
+				SetOriginSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			if err := trace.NewDependency(1, "").
+				SetOriginSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			if err := trace.NewDependency(0, "").
+				SetOriginSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			if err := trace.NewDependency(3, "").
+				AddDestinationSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			if err := trace.NewDependency(4, "").
+				AddDestinationSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			if err := trace.NewDependency(5, "").
+				AddDestinationSpan(trace.Comparator(), span, 30); err != nil {
+				return nil, err
+			}
+			return span, nil
+		},
+		// Later-defined outputs will be placed after earlier ones, and by default,
+		// all inputs are placed before all outputs.
+		wantSpanStr: "() [p-] 0s-30ns, [p0] (I5) 30ns-30ns, [p1] (I4) 30ns-30ns, [p2] (I3) 30ns-30ns (O2), [p3] 30ns-30ns (O1), [p4] 30ns-30ns (O0), [p5] 30ns-100ns",
 	}, {
 		description: "child spans",
 		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
@@ -331,7 +366,7 @@ func TestElementarySpanBuilding(t *testing.T) {
 				return nil, err
 			}
 			return span, trace.NewDependency(0, "").
-				AddDestinationSpan(trace.Comparator(), span, 50, DependencyCanFissionSuspend)
+				AddDestinationSpan(trace.Comparator(), span, 50, DependencyEndpointCanFissionSuspend)
 		},
 		wantSpanStr: "() [p-] 0s-20ns, [p0] (I0) 50ns-50ns, [p1] 80ns-100ns",
 	}, {
@@ -353,7 +388,7 @@ func TestElementarySpanBuilding(t *testing.T) {
 				return nil, err
 			}
 			return span, trace.NewDependency(0, "").
-				SetOriginSpan(trace.Comparator(), span, 50, DependencyCanFissionSuspend)
+				SetOriginSpan(trace.Comparator(), span, 50, DependencyEndpointCanFissionSuspend)
 		},
 		wantSpanStr: "() [p-] 0s-20ns, [p0] 50ns-50ns (O0), [p1] 80ns-100ns",
 	}, {
@@ -404,6 +439,107 @@ func TestElementarySpanBuilding(t *testing.T) {
 			return span, nil
 		},
 		wantSpanStr: "() [p-] 0s-0s, [p0] 100ns-100ns",
+	}, {
+		description: "abutting elementary spans merge after Simplify",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.(*rootSpan[time.Duration, payload, payload, payload]).fissionElementarySpanAt(
+				DurationComparator,
+				50,
+				fissionEarliest,
+			)
+			trace.Simplify()
+			return span, nil
+		},
+		wantSpanStr: "() [p-] 0s-100ns",
+	}, {
+		description: "marks are added correctly",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.Suspend(trace.Comparator(), 30, 70)
+			for _, m := range []struct {
+				label string
+				at    time.Duration
+			}{
+				{"a", 0},
+				{"b", 10},
+				{"c", 20},
+				{"d", 30},
+				{"e", 70},
+				{"f", 80},
+				{"g", 90},
+				{"h", 100},
+			} {
+				if err := span.Mark(trace.Comparator(), m.label, m.at); err != nil {
+					return nil, err
+				}
+			}
+			trace.Simplify()
+			return span, nil
+		},
+		wantSpanStr: "() [p-] 0s-30ns ['a' @0s, 'b' @10ns, 'c' @20ns, 'd' @30ns], [p0] 70ns-100ns ['e' @70ns, 'f' @80ns, 'g' @90ns, 'h' @100ns]",
+	}, {
+		description: "marks divide correctly on fission",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			for _, m := range []struct {
+				label string
+				at    time.Duration
+			}{
+				{"a", 0},
+				{"b", 10},
+				{"c", 20},
+				{"d", 30},
+				{"e", 70},
+				{"f", 80},
+				{"g", 90},
+				{"h", 100},
+			} {
+				if err := span.Mark(trace.Comparator(), m.label, m.at); err != nil {
+					return nil, err
+				}
+			}
+			span.Suspend(trace.Comparator(), 30, 70)
+			trace.Simplify()
+			return span, nil
+		},
+		wantSpanStr: "() [p-] 0s-30ns ['a' @0s, 'b' @10ns, 'c' @20ns, 'd' @30ns], [p0] 70ns-100ns ['e' @70ns, 'f' @80ns, 'g' @90ns, 'h' @100ns]",
+	}, {
+		description: "marks don't go in suspends without permission",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.Suspend(trace.Comparator(), 30, 70)
+			err := span.Mark(trace.Comparator(), "a", 50)
+			return span, err
+		},
+		wantErr: true,
+	}, {
+		description: "suspends don't go around marks without permission",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.Mark(trace.Comparator(), "a", 50)
+			err := span.Suspend(trace.Comparator(), 30, 70)
+			return span, err
+		},
+		wantErr: true,
+	}, {
+		description: "marks can go in suspends with permission",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.Suspend(trace.Comparator(), 30, 70)
+			err := span.Mark(trace.Comparator(), "a", 50, MarkCanFissionSuspend)
+			return span, err
+		},
+		wantSpanStr: "() [p-] 0s-30ns, [p0] 50ns-50ns ['a' @50ns], [p1] 70ns-100ns",
+	}, {
+		description: "suspends don't go around marks without permission",
+		buildSpan: func() (Span[time.Duration, payload, payload, payload], error) {
+			span := trace.NewRootSpan(0, 100, "")
+			span.Mark(trace.Comparator(), "a", 50)
+			err := span.Suspend(trace.Comparator(), 30, 70, SuspendFissionsAroundMarks)
+			return span, err
+		},
+		wantSpanStr: "() [p-] 0s-30ns, [p0] 50ns-50ns ['a' @50ns], [p1] 70ns-100ns",
 	}} {
 		t.Run(test.description, func(t *testing.T) {
 			trace = NewTrace[time.Duration, payload, payload, payload](
@@ -508,7 +644,7 @@ func TestMutable(t *testing.T) {
 			)
 			_, err := ret.NewMutableRootSpan(
 				[]MutableElementarySpan[time.Duration, payload, payload, payload]{
-					NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+					NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 						WithStart(0).
 						WithEnd(100),
 				},
@@ -525,13 +661,13 @@ func TestMutable(t *testing.T) {
 				DurationComparator,
 				&testNamer{},
 			)
-			originES := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+			originES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(0).
 				WithEnd(50)
 			if _, err := ret.NewMutableRootSpan(
 				[]MutableElementarySpan[time.Duration, payload, payload, payload]{
 					originES,
-					NewMutableElementarySpan[time.Duration, payload, payload, payload](originES).
+					NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 						WithStart(50).
 						WithEnd(100),
 				},
@@ -539,10 +675,10 @@ func TestMutable(t *testing.T) {
 			); err != nil {
 				return nil, err
 			}
-			startES := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+			startES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(0).
 				WithEnd(50)
-			destinationES := NewMutableElementarySpan[time.Duration, payload, payload, payload](startES).
+			destinationES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(50).
 				WithEnd(100)
 			if _, err := ret.NewMutableRootSpan(
@@ -555,7 +691,7 @@ func TestMutable(t *testing.T) {
 				return nil, err
 			}
 			ret.NewMutableDependency(0).
-				WithOriginElementarySpan(originES).
+				WithOriginElementarySpan(DurationComparator, originES).
 				WithDestinationElementarySpan(destinationES)
 			return ret, nil
 		},
@@ -569,13 +705,13 @@ func TestMutable(t *testing.T) {
 				DurationComparator,
 				&testNamer{},
 			)
-			parentCallES := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+			parentCallES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(0).
 				WithEnd(30)
-			childReturnES := NewMutableElementarySpan[time.Duration, payload, payload, payload](parentCallES).
+			childReturnES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(60).
 				WithEnd(60)
-			destinationES := NewMutableElementarySpan[time.Duration, payload, payload, payload](childReturnES).
+			destinationES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(60).
 				WithEnd(100)
 			parent, err := ret.NewMutableRootSpan(
@@ -587,10 +723,10 @@ func TestMutable(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			childCallES := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+			childCallES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(30).
 				WithEnd(40)
-			childEndES := NewMutableElementarySpan[time.Duration, payload, payload, payload](childCallES).
+			childEndES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(50).
 				WithEnd(60)
 			child, err := parent.NewMutableChildSpan(
@@ -602,10 +738,10 @@ func TestMutable(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			originES := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil).
+			originES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(40).
 				WithEnd(45)
-			grandchildEndES := NewMutableElementarySpan[time.Duration, payload, payload, payload](originES).
+			grandchildEndES := NewMutableElementarySpan[time.Duration, payload, payload, payload]().
 				WithStart(45).
 				WithEnd(50)
 			if _, err := child.NewMutableChildSpan(
@@ -617,19 +753,19 @@ func TestMutable(t *testing.T) {
 				return nil, err
 			}
 			ret.NewMutableDependency(Call).
-				WithOriginElementarySpan(parentCallES).
+				WithOriginElementarySpan(DurationComparator, parentCallES).
 				WithDestinationElementarySpan(childCallES)
 			ret.NewMutableDependency(Return).
-				WithOriginElementarySpan(childEndES).
+				WithOriginElementarySpan(DurationComparator, childEndES).
 				WithDestinationElementarySpan(childReturnES)
 			ret.NewMutableDependency(Call).
-				WithOriginElementarySpan(childCallES).
+				WithOriginElementarySpan(DurationComparator, childCallES).
 				WithDestinationElementarySpan(originES)
 			ret.NewMutableDependency(Return).
-				WithOriginElementarySpan(grandchildEndES).
+				WithOriginElementarySpan(DurationComparator, grandchildEndES).
 				WithDestinationElementarySpan(childEndES)
 			ret.NewMutableDependency(3).
-				WithOriginElementarySpan(originES).
+				WithOriginElementarySpan(DurationComparator, originES).
 				WithDestinationElementarySpan(destinationES)
 			return ret, nil
 		},
@@ -673,7 +809,7 @@ func TestPayloads(t *testing.T) {
 
 	// Confirm that mutable traces' payloads work.
 	mtrace := NewMutableTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
-	es := NewMutableElementarySpan[time.Duration, payload, payload, payload](nil)
+	es := NewMutableElementarySpan[time.Duration, payload, payload, payload]()
 	mspan, err := mtrace.NewMutableRootSpan(
 		[]MutableElementarySpan[time.Duration, payload, payload, payload]{
 			es,
@@ -688,5 +824,122 @@ func TestPayloads(t *testing.T) {
 	mdep := mtrace.NewMutableDependency(FirstUserDefinedDependencyType).WithPayload("dep1")
 	if mdep.Payload() != "dep1" {
 		t.Errorf("mdep payload = '%s', wanted '%s'", mdep.Payload(), "dep1")
+	}
+}
+
+func TestMultipleOrigins(t *testing.T) {
+	for _, test := range []struct {
+		description                  string
+		buildDependency              func() (Dependency[time.Duration, payload, payload, payload], error)
+		wantErr                      bool
+		wantTriggeringOrigin         bool
+		wantTriggeringOriginSpanName string
+		wantOriginsSpanNames         []string
+	}{{
+		description: "or semantics 1",
+		buildDependency: func() (Dependency[time.Duration, payload, payload, payload], error) {
+			trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
+			a := trace.NewRootSpan(0, 50, "a")
+			b := trace.NewRootSpan(0, 100, "b")
+			c := trace.NewRootSpan(150, 200, "c")
+			dep := trace.NewDependency(FirstUserDefinedDependencyType, "", MultipleOriginsWithOrSemantics)
+			if err := dep.SetOriginSpan(trace.Comparator(), b, 100); err != nil {
+				return nil, err
+			}
+			if err := dep.SetOriginSpan(trace.Comparator(), a, 50); err != nil {
+				return nil, err
+			}
+			if err := dep.AddDestinationSpan(trace.Comparator(), c, 150); err != nil {
+				return nil, err
+			}
+			return dep, nil
+		},
+		wantTriggeringOrigin:         true,
+		wantTriggeringOriginSpanName: "a",
+		wantOriginsSpanNames:         []string{"a", "b"},
+	}, {
+		description: "and semantics 1",
+		buildDependency: func() (Dependency[time.Duration, payload, payload, payload], error) {
+			trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
+			a := trace.NewRootSpan(0, 50, "a")
+			b := trace.NewRootSpan(0, 100, "b")
+			c := trace.NewRootSpan(150, 200, "c")
+			dep := trace.NewDependency(FirstUserDefinedDependencyType, "", MultipleOriginsWithAndSemantics)
+			if err := dep.SetOriginSpan(trace.Comparator(), a, 50); err != nil {
+				return nil, err
+			}
+			if err := dep.SetOriginSpan(trace.Comparator(), b, 100); err != nil {
+				return nil, err
+			}
+			if err := dep.AddDestinationSpan(trace.Comparator(), c, 150); err != nil {
+				return nil, err
+			}
+			return dep, nil
+		},
+		wantTriggeringOrigin:         true,
+		wantTriggeringOriginSpanName: "b",
+		wantOriginsSpanNames:         []string{"a", "b"},
+	}, {
+		description: "error on multiple origins",
+		buildDependency: func() (Dependency[time.Duration, payload, payload, payload], error) {
+			trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
+			a := trace.NewRootSpan(0, 50, "a")
+			b := trace.NewRootSpan(0, 100, "b")
+			c := trace.NewRootSpan(150, 200, "c")
+			dep := trace.NewDependency(FirstUserDefinedDependencyType, "")
+			if err := dep.SetOriginSpan(trace.Comparator(), a, 50); err != nil {
+				return nil, err
+			}
+			if err := dep.SetOriginSpan(trace.Comparator(), b, 100); err != nil {
+				return nil, err
+			}
+			if err := dep.AddDestinationSpan(trace.Comparator(), c, 150); err != nil {
+				return nil, err
+			}
+			return dep, nil
+		},
+		wantErr: true,
+	}, {
+		description: "no triggering origin",
+		buildDependency: func() (Dependency[time.Duration, payload, payload, payload], error) {
+			trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
+			trace.NewRootSpan(0, 100, "a")
+			b := trace.NewRootSpan(0, 100, "b")
+			dep := trace.NewDependency(FirstUserDefinedDependencyType, "")
+			if err := dep.AddDestinationSpan(trace.Comparator(), b, 50); err != nil {
+				return nil, err
+			}
+			return dep, nil
+		},
+		wantTriggeringOrigin: false,
+		wantOriginsSpanNames: []string{},
+	}} {
+		t.Run(test.description, func(t *testing.T) {
+			dep, err := test.buildDependency()
+			if (err != nil) != test.wantErr {
+				t.Fatalf("buildDependency() returned unexpected error %v", err)
+			}
+			if err != nil {
+				return
+			}
+			if test.wantTriggeringOrigin {
+				if string(dep.TriggeringOrigin().Span().Payload()) != test.wantTriggeringOriginSpanName {
+					t.Errorf("triggering origin was '%s', wanted '%s'",
+						dep.TriggeringOrigin().Span().Payload(),
+						test.wantTriggeringOriginSpanName,
+					)
+				}
+			} else if dep.TriggeringOrigin() != nil {
+				t.Errorf("wanted no triggering origin, but got ont")
+			}
+			origins := make([]string, len(dep.Origins()))
+			for idx, origin := range dep.Origins() {
+				origins[idx] = string(origin.Span().Payload())
+			}
+			sort.Strings(origins)
+			if diff := cmp.Diff(test.wantOriginsSpanNames, origins); diff != "" {
+				t.Errorf("Origins() = %v, diff (-want +got) %s", origins, diff)
+			}
+		})
 	}
 }

@@ -19,193 +19,239 @@ package trace
 import (
 	"fmt"
 	"regexp"
-	"sort"
 )
 
-// PathElementMatcher describes types which can match
-type PathElementMatcher[T any, CP, SP, DP fmt.Stringer] interface {
-	fmt.Stringer
-	// Returns true iff the provided span matches this matcher element.
-	MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool
-	MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool
-	MatchesAnything() bool
-	IsGlobstar() bool
+type matchingElementType int
+
+const (
+	name matchingElementType = iota
+	id
+	nothing
+)
+
+func (met matchingElementType) String() string {
+	switch met {
+	case name:
+		return "name"
+	case id:
+		return "ID"
+	case nothing:
+		return "-"
+	default:
+		return "unknown"
+	}
 }
 
-type literalNameMatcher[T any, CP, SP, DP fmt.Stringer] struct {
-	name string
+// PathElementMatcher describes types which can match
+type PathElementMatcher interface {
+	fmt.Stringer
+	match(string) bool
+	matchingElement() matchingElementType
+	matchesAnything() bool
+	isGlobstar() bool
+}
+
+// SpanFilter describes a filter applied to spans during matching.  It accepts
+// a Span, and returns two bools: the first true if the span should be filtered
+// in (true) or out (false); the second true if the traversal should be pruned
+// at this span (true) or should continue to this span's children (false).  A
+// nil SpanFilter filters in all spans and prunes none.
+type SpanFilter[T any, CP, SP, DP fmt.Stringer] func(Span[T, CP, SP, DP]) (include, prune bool)
+
+func matchesSpan[T any, CP, SP, DP fmt.Stringer](
+	pem PathElementMatcher,
+	namer Namer[T, CP, SP, DP],
+	span Span[T, CP, SP, DP],
+) bool {
+	switch pem.matchingElement() {
+	case name:
+		return pem.match(namer.SpanName(span))
+	case id:
+		return pem.match(namer.SpanUniqueID(span))
+	default:
+		return pem.matchesAnything()
+	}
+}
+
+func matchesCategory[T any, CP, SP, DP fmt.Stringer](
+	pem PathElementMatcher,
+	namer Namer[T, CP, SP, DP],
+	category Category[T, CP, SP, DP],
+) bool {
+	switch pem.matchingElement() {
+	case name:
+		return pem.match(namer.CategoryName(category))
+	case id:
+		return pem.match(namer.CategoryUniqueID(category))
+	default:
+		return pem.matchesAnything()
+	}
+}
+
+type literalMatcher struct {
+	literal string
+	met     matchingElementType
 }
 
 // NewLiteralNameMatcher returns a PathElementMatcher which matches path
-// element's names, as rendered by the provided namer, against the provided
+// elements' names, as rendered by the provided namer, against the provided
 // literal name.
-func NewLiteralNameMatcher[T any, CP, SP, DP fmt.Stringer](
-	name string,
-) PathElementMatcher[T, CP, SP, DP] {
-	return &literalNameMatcher[T, CP, SP, DP]{
-		name: name,
+func NewLiteralNameMatcher(
+	literal string,
+) PathElementMatcher {
+	return &literalMatcher{
+		literal: literal,
+		met:     name,
 	}
-}
-
-func (lnm *literalNameMatcher[T, CP, SP, DP]) MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool {
-	return namer.SpanName(span) == lnm.name
-}
-
-func (lnm *literalNameMatcher[T, CP, SP, DP]) MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool {
-	return namer.CategoryName(category) == lnm.name
-}
-
-func (lnm *literalNameMatcher[T, CP, SP, DP]) MatchesAnything() bool {
-	return false
-}
-
-func (lnm *literalNameMatcher[T, CP, SP, DP]) IsGlobstar() bool {
-	return false
-}
-
-func (lnm *literalNameMatcher[T, CP, SP, DP]) String() string {
-	return fmt.Sprintf("<literal name %s>", lnm.name)
-}
-
-type literalIDMatcher[T any, CP, SP, DP fmt.Stringer] struct {
-	id string
 }
 
 // NewLiteralIDMatcher returns a PathElementMatcher which matches path
-// element's unique IDs, as rendered by the provided namer, against the
-// provided literal ID.
-func NewLiteralIDMatcher[T any, CP, SP, DP fmt.Stringer](
-	id string,
-) PathElementMatcher[T, CP, SP, DP] {
-	return &literalIDMatcher[T, CP, SP, DP]{
-		id: id,
+// elements' unique IDs, as rendered by the provided namer, against the
+// provided literal name.
+func NewLiteralIDMatcher(
+	literal string,
+) PathElementMatcher {
+	return &literalMatcher{
+		literal: literal,
+		met:     id,
 	}
 }
 
-func (lim *literalIDMatcher[T, CP, SP, DP]) MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool {
-	return namer.SpanUniqueID(span) == lim.id
+func (lm *literalMatcher) match(literal string) bool {
+	return literal == lm.literal
 }
 
-func (lim *literalIDMatcher[T, CP, SP, DP]) MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool {
-	return namer.CategoryUniqueID(category) == lim.id
+func (lm *literalMatcher) matchingElement() matchingElementType {
+	return lm.met
 }
 
-func (lim *literalIDMatcher[T, CP, SP, DP]) MatchesAnything() bool {
+func (lm *literalMatcher) matchesAnything() bool {
 	return false
 }
 
-func (lim *literalIDMatcher[T, CP, SP, DP]) IsGlobstar() bool {
+func (lm *literalMatcher) isGlobstar() bool {
 	return false
 }
 
-func (lim *literalIDMatcher[T, CP, SP, DP]) String() string {
-	return fmt.Sprintf("<literal ID %s>", lim.id)
+func (lm *literalMatcher) String() string {
+	return fmt.Sprintf("<literal %s %s>", lm.met, lm.literal)
 }
 
-type regexpNameMatcher[T any, CP, SP, DP fmt.Stringer] struct {
+type regexpMatcher struct {
 	regex *regexp.Regexp
+	met   matchingElementType
 }
 
 // NewRegexpNameMatcher returns a PathElementMatcher which matches path
-// element's names, as rendered by the provided namer, against the provided
+// elements' names, as rendered by the provided namer, against the provided
 // regular expression.
-func NewRegexpNameMatcher[T any, CP, SP, DP fmt.Stringer](
+func NewRegexpNameMatcher(
 	regexStr string,
-) (PathElementMatcher[T, CP, SP, DP], error) {
+) (PathElementMatcher, error) {
 	regex, err := regexp.Compile(regexStr)
 	if err != nil {
 		return nil, err
 	}
-	return &regexpNameMatcher[T, CP, SP, DP]{
+	return &regexpMatcher{
 		regex: regex,
+		met:   name,
 	}, nil
 }
 
-func (rnm *regexpNameMatcher[T, CP, SP, DP]) MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool {
-	spanName := namer.SpanName(span)
-	return rnm.regex.MatchString(spanName)
+// NewRegexpIDMatcher returns a PathElementMatcher which matches path
+// elements' unique IDs, as rendered by the provided namer, against the
+// provided regular expression.
+func NewRegexpIDMatcher[T any, CP, SP, DP fmt.Stringer](
+	regexStr string,
+) (PathElementMatcher, error) {
+
+	regex, err := regexp.Compile(regexStr)
+	if err != nil {
+		return nil, err
+	}
+	return &regexpMatcher{
+		regex: regex,
+		met:   id,
+	}, nil
 }
 
-func (rnm *regexpNameMatcher[T, CP, SP, DP]) MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool {
-	categoryName := namer.CategoryName(category)
-	return rnm.regex.MatchString(categoryName)
+func (rm *regexpMatcher) match(literal string) bool {
+	return rm.regex.MatchString(literal)
 }
 
-func (rnm *regexpNameMatcher[T, CP, SP, DP]) MatchesAnything() bool {
+func (rm *regexpMatcher) matchingElement() matchingElementType {
+	return rm.met
+}
+
+func (rm *regexpMatcher) matchesAnything() bool {
 	return false
 }
 
-func (rnm *regexpNameMatcher[T, CP, SP, DP]) IsGlobstar() bool {
+func (rm *regexpMatcher) isGlobstar() bool {
 	return false
 }
 
-func (rnm *regexpNameMatcher[T, CP, SP, DP]) String() string {
-	return fmt.Sprintf("<regexp %s>", rnm.regex.String())
+func (rm *regexpMatcher) String() string {
+	return fmt.Sprintf("<regexp %s %s>", rm.met, rm.regex.String())
 }
 
-type globstar[T any, CP, SP, DP fmt.Stringer] struct{}
+type globstar struct{}
 
-func (g globstar[T, CP, SP, DP]) MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool {
+func (g globstar) match(literal string) bool {
 	return true
 }
 
-func (g globstar[T, CP, SP, DP]) MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool {
+func (g globstar) matchingElement() matchingElementType {
+	return nothing
+}
+
+func (g globstar) matchesAnything() bool {
 	return true
 }
 
-func (g globstar[T, CP, SP, DP]) MatchesAnything() bool {
+func (g globstar) isGlobstar() bool {
 	return true
 }
 
-func (g globstar[T, CP, SP, DP]) IsGlobstar() bool {
-	return true
-}
-
-func (g globstar[T, CP, SP, DP]) String() string {
+func (g globstar) String() string {
 	return fmt.Sprintf("<globstar>")
 }
 
-// Globstar returns a new globstar matcher.  A globstar matcher matches any
-// number of path elements.
-func Globstar[T any, CP, SP, DP fmt.Stringer]() PathElementMatcher[T, CP, SP, DP] {
-	return globstar[T, CP, SP, DP]{}
-}
+// Globstar is a globstar matcher, matching any number of path elements.
+var Globstar = globstar{}
 
-type star[T any, CP, SP, DP fmt.Stringer] struct{}
+type star struct{}
 
-func (s star[T, CP, SP, DP]) MatchesSpan(namer Namer[T, CP, SP, DP], span Span[T, CP, SP, DP]) bool {
+func (s star) match(literal string) bool {
 	return true
 }
 
-func (s star[T, CP, SP, DP]) MatchesCategory(namer Namer[T, CP, SP, DP], category Category[T, CP, SP, DP]) bool {
+func (s star) matchingElement() matchingElementType {
+	return nothing
+}
+
+func (s star) matchesAnything() bool {
 	return true
 }
 
-func (s star[T, CP, SP, DP]) MatchesAnything() bool {
-	return true
-}
-
-func (s star[T, CP, SP, DP]) IsGlobstar() bool {
+func (s star) isGlobstar() bool {
 	return false
 }
 
-func (s star[T, CP, SP, DP]) String() string {
+func (s star) String() string {
 	return fmt.Sprintf("<star>")
 }
 
-// Star returns a new star matcher.  A star matcher matches any single path
-// element.
-func Star[T any, CP, SP, DP fmt.Stringer]() PathElementMatcher[T, CP, SP, DP] {
-	return star[T, CP, SP, DP]{}
-}
+// Star is a star matcher, matching any single path element.
+var Star = star{}
 
 // A generalization of the matcher-visitor pattern required for both Span and
 // Category.
-func visit[E any, T any, CP, SP, DP fmt.Stringer](
+func visit[E any](
 	els []E,
-	matchers []PathElementMatcher[T, CP, SP, DP],
+	matchers []PathElementMatcher,
 	// Should return true if the provided matcher matches the provided element.
-	matchFn func(el E, matcher PathElementMatcher[T, CP, SP, DP]) bool,
+	matchFn func(el E, matcher PathElementMatcher) bool,
 	// Should return all children of the provided element.
 	getChildrenFn func(el E) []E,
 	// Should record that the provided elements match.  Note that the same
@@ -219,7 +265,7 @@ func visit[E any, T any, CP, SP, DP fmt.Stringer](
 	thisMatcher, remainingMatchers := matchers[0], matchers[1:]
 	noMoreMatchers := len(remainingMatchers) == 0
 	switch {
-	case thisMatcher.IsGlobstar():
+	case thisMatcher.isGlobstar():
 		if noMoreMatchers {
 			elsMatchFn(els...)
 		}
@@ -227,7 +273,7 @@ func visit[E any, T any, CP, SP, DP fmt.Stringer](
 		for _, el := range els {
 			visit(getChildrenFn(el), matchers, matchFn, getChildrenFn, elsMatchFn)
 		}
-	case noMoreMatchers && thisMatcher.MatchesAnything():
+	case noMoreMatchers && thisMatcher.matchesAnything():
 		elsMatchFn(els...)
 	case noMoreMatchers:
 		for _, el := range els {
@@ -236,13 +282,13 @@ func visit[E any, T any, CP, SP, DP fmt.Stringer](
 			}
 		}
 	default:
-		matchingEls := []E{}
+		var matchingEls []E
 		for _, el := range els {
 			if matchFn(el, thisMatcher) {
 				matchingEls = append(matchingEls, el)
 			}
 		}
-		if remainingMatchers[0].IsGlobstar() {
+		if remainingMatchers[0].isGlobstar() {
 			// Since globstars, uniquely, can match no spans, if the next matcher
 			// is a globstar, we have to apply all subsequent patterns *here* too.
 			visit(matchingEls, remainingMatchers, matchFn, getChildrenFn, elsMatchFn)
@@ -264,14 +310,15 @@ func FindSpanByEncodedIDPath[T any, CP, SP, DP fmt.Stringer](
 	if err != nil {
 		return nil, err
 	}
-	matchers := make([]PathElementMatcher[T, CP, SP, DP], len(path))
+	matchers := make([]PathElementMatcher, len(path))
 	for idx, pathEl := range path {
-		matchers[idx] = NewLiteralIDMatcher[T, CP, SP, DP](pathEl)
+		matchers[idx] = NewLiteralIDMatcher(pathEl)
 	}
 	spans := findSpans(
 		trace,
 		namer,
-		[][]PathElementMatcher[T, CP, SP, DP]{matchers},
+		nil,
+		matchers,
 		SpanOnlyHierarchyType,
 		nil,
 	)
@@ -281,71 +328,83 @@ func FindSpanByEncodedIDPath[T any, CP, SP, DP fmt.Stringer](
 	return spans[0], nil
 }
 
+func applySpanFilter[T any, CP, SP, DP fmt.Stringer](
+	span Span[T, CP, SP, DP],
+	spanFilter SpanFilter[T, CP, SP, DP],
+) (include, prune bool) {
+	if spanFilter == nil {
+		return true, false
+	}
+	return spanFilter(span)
+}
+
 // findSpans finds and returns all spans from the provided trace whose stacks
-// match the provided matcher slice.
+// match the provided matcher slices.
 func findSpans[T any, CP, SP, DP fmt.Stringer](
 	trace Trace[T, CP, SP, DP],
 	namer Namer[T, CP, SP, DP],
-	spanMatchers [][]PathElementMatcher[T, CP, SP, DP],
+	spanFilter SpanFilter[T, CP, SP, DP],
+	spanMatchers []PathElementMatcher,
 	hierarchyType HierarchyType,
-	categoryMatchers [][]PathElementMatcher[T, CP, SP, DP],
+	categoryMatchers []PathElementMatcher,
 ) []Span[T, CP, SP, DP] {
-	if len(spanMatchers) == 0 || (hierarchyType != SpanOnlyHierarchyType && len(categoryMatchers) == 0) {
+	if len(spanMatchers) == 0 {
 		return nil
 	}
 	includedSpans := map[Span[T, CP, SP, DP]]struct{}{}
-	ret := []Span[T, CP, SP, DP]{}
+	var ret []Span[T, CP, SP, DP]
 	addSpans := func(spans ...Span[T, CP, SP, DP]) {
 		for _, span := range spans {
-			_, ok := includedSpans[span]
-			if !ok {
-				includedSpans[span] = struct{}{}
-				ret = append(ret, span)
+			if include, _ := applySpanFilter(span, spanFilter); include {
+				if _, ok := includedSpans[span]; !ok {
+					includedSpans[span] = struct{}{}
+					ret = append(ret, span)
+				}
 			}
 		}
 	}
 	var rootSpans []Span[T, CP, SP, DP]
-	if hierarchyType == SpanOnlyHierarchyType {
-		rootSpans = make([]Span[T, CP, SP, DP], len(trace.RootSpans()))
-		for idx, rs := range trace.RootSpans() {
-			rootSpans[idx] = rs
+	if len(categoryMatchers) == 0 || hierarchyType == SpanOnlyHierarchyType {
+		for _, rs := range trace.RootSpans() {
+			rootSpans = append(rootSpans, rs)
 		}
 	} else {
-		for _, cat := range FindCategories(trace, namer, hierarchyType, categoryMatchers) {
+		for _, cat := range findCategories(trace, namer, hierarchyType, categoryMatchers) {
 			for _, span := range cat.RootSpans() {
 				rootSpans = append(rootSpans, span)
 			}
 		}
 	}
-	for _, matcherSlice := range spanMatchers {
-		visit[Span[T, CP, SP, DP], T, CP, SP, DP](
-			rootSpans,
-			matcherSlice,
-			func(span Span[T, CP, SP, DP], matcher PathElementMatcher[T, CP, SP, DP]) bool {
-				return matcher.MatchesSpan(namer, span)
-			},
-			func(span Span[T, CP, SP, DP]) []Span[T, CP, SP, DP] {
-				return span.ChildSpans()
-			},
-			addSpans,
-		)
-	}
+	visit(
+		rootSpans,
+		spanMatchers,
+		func(span Span[T, CP, SP, DP], matcher PathElementMatcher) bool {
+			return matchesSpan(matcher, namer, span)
+		},
+		func(span Span[T, CP, SP, DP]) []Span[T, CP, SP, DP] {
+			if _, prune := applySpanFilter(span, spanFilter); prune {
+				return nil
+			}
+			return span.ChildSpans()
+		},
+		addSpans,
+	)
 	return ret
 }
 
-// FindCategories finds and returns all categories from the provided trace
+// findCategories finds and returns all categories from the provided trace
 // whose stacks match the provided matcher slice.
-func FindCategories[T any, CP, SP, DP fmt.Stringer](
+func findCategories[T any, CP, SP, DP fmt.Stringer](
 	trace Trace[T, CP, SP, DP],
 	namer Namer[T, CP, SP, DP],
 	ht HierarchyType,
-	matchers [][]PathElementMatcher[T, CP, SP, DP],
+	matchers []PathElementMatcher,
 ) []Category[T, CP, SP, DP] {
 	if len(matchers) == 0 {
 		return nil
 	}
 	includedCategories := map[Category[T, CP, SP, DP]]struct{}{}
-	ret := []Category[T, CP, SP, DP]{}
+	var ret []Category[T, CP, SP, DP]
 	addCategories := func(categories ...Category[T, CP, SP, DP]) {
 		for _, category := range categories {
 			_, ok := includedCategories[category]
@@ -360,75 +419,204 @@ func FindCategories[T any, CP, SP, DP fmt.Stringer](
 	for idx, rs := range trace.RootCategories(ht) {
 		rootCategories[idx] = rs
 	}
-	for _, matcherSlice := range matchers {
-		visit[Category[T, CP, SP, DP], T, CP, SP, DP](
-			rootCategories,
-			matcherSlice,
-			func(category Category[T, CP, SP, DP], matcher PathElementMatcher[T, CP, SP, DP]) bool {
-				return matcher.MatchesCategory(namer, category)
-			},
-			func(category Category[T, CP, SP, DP]) []Category[T, CP, SP, DP] {
-				return category.ChildCategories()
-			},
-			addCategories,
+	visit(
+		rootCategories,
+		matchers,
+		func(category Category[T, CP, SP, DP], matcher PathElementMatcher) bool {
+			return matchesCategory(matcher, namer, category)
+		},
+		func(category Category[T, CP, SP, DP]) []Category[T, CP, SP, DP] {
+			return category.ChildCategories()
+		},
+		addCategories,
+	)
+	return ret
+}
+
+type spanAndCategoryMatcher struct {
+	ht               HierarchyType
+	spanMatchers     []PathElementMatcher
+	categoryMatchers []PathElementMatcher
+}
+
+// SpanPattern describes a pattern matching a set of spans, not yet
+// specialized to a particular Trace or Namer.
+type SpanPattern struct {
+	matchers []*spanAndCategoryMatcher
+}
+
+// SpanPatternOption is an option applied to NewSpanPattern.
+type SpanPatternOption func(
+	sp *SpanPattern,
+)
+
+// SpanMatchers applies a set of span matcher patterns to NewSpanPattern.
+func SpanMatchers(
+	spanMatchersSets ...[]PathElementMatcher,
+) SpanPatternOption {
+	return func(sp *SpanPattern) {
+		for _, spanMatchers := range spanMatchersSets {
+			sp.matchers = append(sp.matchers, &spanAndCategoryMatcher{
+				ht:           SpanOnlyHierarchyType,
+				spanMatchers: spanMatchers,
+			})
+		}
+	}
+}
+
+// SpanAndCategoryMatchers applies sets of span and category matcher patterns
+// to NewSpanPattern.  If the category matcher patterns are nonempty, they will
+// be used to find categories on invocations of SpanFinder.FindCategories;
+// otherwise the span matcher patterns will also be used to find categories.
+func SpanAndCategoryMatchers(
+	hierarchyType HierarchyType,
+	categoryMatchers []PathElementMatcher,
+	spanMatchers []PathElementMatcher,
+) SpanPatternOption {
+	return func(sp *SpanPattern) {
+		sp.matchers = append(sp.matchers, &spanAndCategoryMatcher{
+			ht:               hierarchyType,
+			categoryMatchers: categoryMatchers,
+			spanMatchers:     spanMatchers,
+		})
+	}
+}
+
+// NewSpanPattern returns a new SpanPattern with the provided— options applied.
+func NewSpanPattern(
+	opts ...SpanPatternOption,
+) *SpanPattern {
+	ret := &SpanPattern{}
+	for _, opt := range opts {
+		opt(ret)
+	}
+	return ret
+}
+
+// FindCategoryOption defines an option to SpanFinder's FindCategories()
+// method.
+type FindCategoryOption func(*findCategoryOpts)
+
+// SpanFinder instances can return slices of Spans from a particular Trace that
+// match some selection criteria.
+type SpanFinder[T any, CP, SP, DP fmt.Stringer] interface {
+	Comparator() Comparator[T]
+	FindSpans() []Span[T, CP, SP, DP]
+	FindCategories(opts ...FindCategoryOption) []Category[T, CP, SP, DP]
+	// Defaults to the trace's DefaultNamer.
+	WithNamer(Namer[T, CP, SP, DP]) SpanFinder[T, CP, SP, DP]
+	// If specified, only spans for which the provided function returns true are
+	// traversed.
+	WithSpanFilter(SpanFilter[T, CP, SP, DP]) SpanFinder[T, CP, SP, DP]
+}
+
+func allSpans[T any, CP, SP, DP fmt.Stringer](t Trace[T, CP, SP, DP]) SpanFinder[T, CP, SP, DP] {
+	return NewSpanFinder(
+		NewSpanPattern(SpanMatchers([]PathElementMatcher{Globstar})),
+		t)
+}
+
+type spanFinder[T any, CP, SP, DP fmt.Stringer] struct {
+	sp         *SpanPattern
+	t          Trace[T, CP, SP, DP]
+	namer      Namer[T, CP, SP, DP]
+	spanFilter SpanFilter[T, CP, SP, DP]
+}
+
+func (sf *spanFinder[T, CP, SP, DP]) FindSpans() []Span[T, CP, SP, DP] {
+	var ret []Span[T, CP, SP, DP]
+	for _, matcher := range sf.sp.matchers {
+		ret = append(
+			ret,
+			findSpans(sf.t, sf.namer, sf.spanFilter, matcher.spanMatchers, matcher.ht, matcher.categoryMatchers)...,
 		)
 	}
 	return ret
 }
 
-// SpanFinder facilitates finding spans by pattern within a trace.
-type SpanFinder[T any, CP, SP, DP fmt.Stringer] struct {
-	namer            Namer[T, CP, SP, DP]
-	spanMatchers     [][]PathElementMatcher[T, CP, SP, DP]
-	categoryMatchers map[HierarchyType][][]PathElementMatcher[T, CP, SP, DP]
+type findCategoryOpts struct {
+	useSpanIfNoCategory, useCategoryEvenIfSpan bool
 }
 
-// NewSpanFinder returns a new SpanFinder, using the provided trace namer.
-func NewSpanFinder[T any, CP, SP, DP fmt.Stringer](
+// UseSpanIfNoCategory specifies that FindCategories should use a matcher's
+// span pattern to match categories, if no category pattern is specified.  This
+// option should be used when only a single pattern, which could identify
+// either spans or categories, has been specified.
+func UseSpanIfNoCategory(fco *findCategoryOpts) {
+	fco.useSpanIfNoCategory = true
+}
+
+// UseCategoryEvenIfSpan specifies that FindCategories should use a matcher's
+// category pattern to match categories, even if the span pattern is populated.
+// This option should be used when the set of categories containing matched
+// spans is desired.
+func UseCategoryEvenIfSpan(fco *findCategoryOpts) {
+	fco.useCategoryEvenIfSpan = true
+}
+
+func (sf *spanFinder[T, CP, SP, DP]) FindCategories(
+	opts ...FindCategoryOption,
+) []Category[T, CP, SP, DP] {
+	fco := &findCategoryOpts{}
+	for _, opt := range opts {
+		opt(fco)
+	}
+	var ret []Category[T, CP, SP, DP]
+	if sf.spanFilter != nil {
+		// SpanFinders with applied span filters cannot find categories.
+		return ret
+	}
+	for _, matcher := range sf.sp.matchers {
+		if matcher.ht == SpanOnlyHierarchyType {
+			continue
+		}
+		var pems []PathElementMatcher
+		if fco.useSpanIfNoCategory && len(matcher.categoryMatchers) == 0 {
+			pems = matcher.spanMatchers
+		}
+		if len(matcher.categoryMatchers) > 0 && (fco.useCategoryEvenIfSpan || len(matcher.spanMatchers) == 0) {
+			pems = matcher.categoryMatchers
+		}
+		if len(pems) == 0 {
+			continue
+		}
+		ret = append(
+			ret,
+			findCategories(sf.t, sf.namer, matcher.ht, pems)...,
+		)
+	}
+	return ret
+}
+
+func (sf *spanFinder[T, CP, SP, DP]) Comparator() Comparator[T] {
+	return sf.t.Comparator()
+}
+
+func (sf *spanFinder[T, CP, SP, DP]) WithNamer(
 	namer Namer[T, CP, SP, DP],
-) *SpanFinder[T, CP, SP, DP] {
-	return &SpanFinder[T, CP, SP, DP]{
-		namer:            namer,
-		categoryMatchers: map[HierarchyType][][]PathElementMatcher[T, CP, SP, DP]{},
-	}
-}
-
-// WithSpanMatchers adds the specified span matchers.
-func (sf *SpanFinder[T, CP, SP, DP]) WithSpanMatchers(
-	spanMatchers ...[]PathElementMatcher[T, CP, SP, DP],
-) *SpanFinder[T, CP, SP, DP] {
-	sf.spanMatchers = append(sf.spanMatchers, spanMatchers...)
+) SpanFinder[T, CP, SP, DP] {
+	sf.namer = namer
 	return sf
 }
 
-// WithCategoryMatchers adds the specified span
-func (sf *SpanFinder[T, CP, SP, DP]) WithCategoryMatchers(
-	hierarchyType HierarchyType,
-	categoryMatchers ...[]PathElementMatcher[T, CP, SP, DP],
-) *SpanFinder[T, CP, SP, DP] {
-	if hierarchyType != SpanOnlyHierarchyType && len(categoryMatchers) > 0 {
-		sf.categoryMatchers[hierarchyType] = append(sf.categoryMatchers[hierarchyType], categoryMatchers...)
-	}
+func (sf *spanFinder[T, CP, SP, DP]) WithSpanFilter(spanFilter SpanFilter[T, CP, SP, DP]) SpanFinder[T, CP, SP, DP] {
+	sf.spanFilter = spanFilter
 	return sf
 }
 
-// Find returns all spans matching the receiver within the provided Trace.
-func (sf *SpanFinder[T, CP, SP, DP]) Find(
+// NewSpanFinder returns a new SpanFinder applying the provided SpanFinder to
+// the provided Trace.
+func NewSpanFinder[T any, CP, SP, DP fmt.Stringer](
+	sp *SpanPattern,
 	t Trace[T, CP, SP, DP],
-) []Span[T, CP, SP, DP] {
-	if len(sf.categoryMatchers) == 0 {
-		return findSpans(t, sf.namer, sf.spanMatchers, SpanOnlyHierarchyType, nil)
+) SpanFinder[T, CP, SP, DP] {
+	if sp == nil {
+		return allSpans(t)
 	}
-	hts := make([]HierarchyType, 0, len(sf.categoryMatchers))
-	for ht := range sf.categoryMatchers {
-		hts = append(hts, ht)
-	}
-	sort.Slice(hts, func(a, b int) bool {
-		return hts[a] < hts[b]
-	})
-	ret := []Span[T, CP, SP, DP]{}
-	for _, ht := range hts {
-		ret = append(ret, findSpans(t, sf.namer, sf.spanMatchers, ht, sf.categoryMatchers[ht])...)
+	ret := &spanFinder[T, CP, SP, DP]{
+		sp:    sp,
+		t:     t,
+		namer: t.DefaultNamer(),
 	}
 	return ret
 }

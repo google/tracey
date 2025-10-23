@@ -20,13 +20,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/tracey/trace"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/tracey/trace"
 )
 
-var tpp = NewPrettyPrinter[time.Duration, StringPayload, StringPayload, StringPayload](
-	HierarchyTypeNames, DependencyTypeNames,
-)
+var tpp = NewPrettyPrinter[time.Duration, StringPayload, StringPayload, StringPayload](TestNamer)
 
 func TestTraceBuildingAndPrettyprinting(t *testing.T) {
 	for _, test := range []struct {
@@ -86,7 +84,9 @@ Trace spans:
   Span 's0.0.0' (0s-100ns) (s0.0.0)
     Elementary spans:
       0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+        'start' @0s
       90ns-100ns [return from s0.0.0/0 @90ns] -> THIS -> <none>
+        'end' @100ns
     Span '0' (10ns-90ns) (s0.0.0/0)
       Elementary spans:
         10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
@@ -123,7 +123,9 @@ Trace (causal):
         Span 's0.0.0' (0s-100ns) (s0.0.0)
           Elementary spans:
             0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+              'start' @0s
             90ns-100ns [return from s0.0.0/0 @90ns] -> THIS -> <none>
+              'end' @100ns
           Span '0' (10ns-90ns) (s0.0.0/0)
             Elementary spans:
               10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
@@ -165,7 +167,9 @@ Trace (structural):
         Span 's0.0.0' (0s-100ns) (s0.0.0)
           Elementary spans:
             0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+              'start' @0s
             90ns-100ns [return from s0.0.0/0 @90ns] -> THIS -> <none>
+              'end' @100ns
           Span '0' (10ns-90ns) (s0.0.0/0)
             Elementary spans:
               10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
@@ -190,6 +194,104 @@ Trace (structural):
           Elementary spans:
             30ns-35ns [spawn from s0.0.0/0 @30ns] -> THIS -> [send to s0.1.0 @40ns]
             35ns-50ns <none> -> THIS -> <none>`,
+	}, {
+		description: "multiple origins, OR semantics",
+		buildTrace: func() (
+			trace.Trace[time.Duration, StringPayload, StringPayload, StringPayload],
+			error,
+		) {
+			var err error
+			originalTrace := NewTraceBuilderWithErrorHandler(func(gotErr error) {
+				err = gotErr
+			}).
+				WithRootSpans(
+					RootSpan(0, 50, "a launcher", ParentCategories()),
+					RootSpan(0, 100, "b launcher", ParentCategories()),
+					RootSpan(50, 100, "cached", ParentCategories()),
+					RootSpan(50, 100, "a", ParentCategories()),
+					RootSpan(100, 150, "b", ParentCategories()),
+				).
+				WithDependency(
+					Spawn,
+					"",
+					Origin(Paths("a launcher"), 50),
+					Destination(Paths("a"), 50),
+				).
+				WithDependency(
+					Spawn,
+					"",
+					Origin(Paths("b launcher"), 100),
+					Destination(Paths("b"), 100),
+				).
+				WithDependency(
+					Send,
+					"",
+					trace.MultipleOriginsWithOrSemantics,
+					Origin(Paths("a"), 50),
+					Origin(Paths("b"), 100),
+					Destination(Paths("cached"), 50),
+				).
+				Build()
+			return originalTrace, err
+		},
+		hierarchyType: trace.SpanOnlyHierarchyType,
+		wantTraceStr: `
+Trace spans:
+  Span 'a' (50ns-100ns) (a)
+    Elementary spans:
+      50ns-50ns [spawn from a launcher @50ns] -> THIS -> [send to cached @50ns]
+      50ns-100ns <none> -> THIS -> <none>
+  Span 'a launcher' (0s-50ns) (a launcher)
+    Elementary spans:
+      0s-50ns <none> -> THIS -> [spawn to a @50ns]
+  Span 'b' (100ns-150ns) (b)
+    Elementary spans:
+      100ns-100ns [spawn from b launcher @100ns] -> THIS -> [send to cached @50ns]
+      100ns-150ns <none> -> THIS -> <none>
+  Span 'b launcher' (0s-100ns) (b launcher)
+    Elementary spans:
+      0s-100ns <none> -> THIS -> [spawn to b @100ns]
+  Span 'cached' (50ns-100ns) (cached)
+    Elementary spans:
+      50ns-100ns [send from (triggering) a @50ns (also nontriggering b @100ns)] -> THIS -> <none>`,
+	}, {
+		description: "multiple origins, AND semantics",
+		buildTrace: func() (
+			trace.Trace[time.Duration, StringPayload, StringPayload, StringPayload],
+			error,
+		) {
+			var err error
+			originalTrace := NewTraceBuilderWithErrorHandler(func(gotErr error) {
+				err = gotErr
+			}).
+				WithRootSpans(
+					RootSpan(100, 150, "blocked", ParentCategories()),
+					RootSpan(0, 50, "a", ParentCategories()),
+					RootSpan(0, 100, "b", ParentCategories()),
+				).
+				WithDependency(
+					Send,
+					"",
+					trace.MultipleOriginsWithAndSemantics,
+					Origin(Paths("a"), 50),
+					Origin(Paths("b"), 100),
+					Destination(Paths("blocked"), 100),
+				).
+				Build()
+			return originalTrace, err
+		},
+		hierarchyType: trace.SpanOnlyHierarchyType,
+		wantTraceStr: `
+Trace spans:
+  Span 'a' (0s-50ns) (a)
+    Elementary spans:
+      0s-50ns <none> -> THIS -> [send to blocked @100ns]
+  Span 'b' (0s-100ns) (b)
+    Elementary spans:
+      0s-100ns <none> -> THIS -> [send to blocked @100ns]
+  Span 'blocked' (100ns-150ns) (blocked)
+    Elementary spans:
+      100ns-150ns [send from (triggering) b @100ns (also nontriggering a @50ns)] -> THIS -> <none>`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
 			trace, err := test.buildTrace()

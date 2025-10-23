@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/google/tracey/trace"
+	traceparser "github.com/google/tracey/trace/parser"
 )
 
 // ElementarySpanner wraps a Trace elementary span for antagonism logging.
@@ -45,11 +46,11 @@ type antagonismLogger[T any, CP, SP, DP fmt.Stringer] interface {
 type Group[T any, CP, SP, DP fmt.Stringer] struct {
 	name string
 	// Exactly one of {victimFinder, victimElementarySpansFn} must be non-nil.
-	victimFinder            *trace.SpanFinder[T, CP, SP, DP]
+	victimSpanPattern       *traceparser.SpanPattern
 	victimElementarySpansFn func(trace.Wrapper[T, CP, SP, DP]) ([]trace.ElementarySpan[T, CP, SP, DP], error)
 	// Exactly one of {antagonistFinder, antagonistElementarySpansFn} must be
 	// non-nil.
-	antagonistFinder            *trace.SpanFinder[T, CP, SP, DP]
+	antagonistSpanPattern       *traceparser.SpanPattern
 	antagonistElementarySpansFn func(trace.Wrapper[T, CP, SP, DP]) ([]trace.ElementarySpan[T, CP, SP, DP], error)
 }
 
@@ -63,14 +64,14 @@ func NewGroup[T any, CP, SP, DP fmt.Stringer](
 	}
 }
 
-// WithVictimFinder specifies that the receiver's set of victims should match
-// the provided SpanFinder, returning the receiver to facilitate streaming.  If
-// the receiver has already specified a victim SpanFinder or elementary span
-// function, the previous value is overwritten.
-func (g *Group[T, CP, SP, DP]) WithVictimFinder(
-	victimFinder *trace.SpanFinder[T, CP, SP, DP],
+// WithVictimSpanPattern specifies that the receiver's set of victims should
+// match the provided SpanFinder, returning the receiver to facilitate
+// streaming.  If the receiver has already specified a victim SpanFinder or
+// elementary span function, the previous value is overwritten.
+func (g *Group[T, CP, SP, DP]) WithVictimSpanPattern(
+	victimSpanPattern *traceparser.SpanPattern,
 ) *Group[T, CP, SP, DP] {
-	g.victimFinder = victimFinder
+	g.victimSpanPattern = victimSpanPattern
 	g.victimElementarySpansFn = nil
 	return g
 }
@@ -82,19 +83,19 @@ func (g *Group[T, CP, SP, DP]) WithVictimFinder(
 func (g *Group[T, CP, SP, DP]) WithVictimElementarySpansFn(
 	fn func(trace.Wrapper[T, CP, SP, DP]) ([]trace.ElementarySpan[T, CP, SP, DP], error),
 ) *Group[T, CP, SP, DP] {
-	g.victimFinder = nil
+	g.victimSpanPattern = nil
 	g.victimElementarySpansFn = fn
 	return g
 }
 
-// WithAntagonistFinder specifies that the receiver's set of antagonists should
-// match the provided SpanFinder, returning the receiver to facilitate
+// WithAntagonistSpanPattern specifies that the receiver's set of antagonists
+// should match the provided SpanFinder, returning the receiver to facilitate
 // streaming.  If the receiver has already specified an antagonist SpanFinder
 // or elementary span function, the previous value is overwritten.
-func (g *Group[T, CP, SP, DP]) WithAntagonistFinder(
-	antagonistFinder *trace.SpanFinder[T, CP, SP, DP],
+func (g *Group[T, CP, SP, DP]) WithAntagonistSpanPattern(
+	antagonistSpanPattern *traceparser.SpanPattern,
 ) *Group[T, CP, SP, DP] {
-	g.antagonistFinder = antagonistFinder
+	g.antagonistSpanPattern = antagonistSpanPattern
 	g.antagonistElementarySpansFn = nil
 	return g
 }
@@ -106,7 +107,7 @@ func (g *Group[T, CP, SP, DP]) WithAntagonistFinder(
 func (g *Group[T, CP, SP, DP]) WithAntagonistElementarySpansFn(
 	fn func(trace.Wrapper[T, CP, SP, DP]) ([]trace.ElementarySpan[T, CP, SP, DP], error),
 ) *Group[T, CP, SP, DP] {
-	g.antagonistFinder = nil
+	g.antagonistSpanPattern = nil
 	g.antagonistElementarySpansFn = fn
 	return g
 }
@@ -145,7 +146,7 @@ func newAntagonismElementarySpan[T any, CP, SP, DP fmt.Stringer](
 	if es.Predecessor() != nil {
 		ret.pendingDependencies++
 	}
-	if es.Incoming() != nil && es.Incoming().Origin() != nil {
+	if es.Incoming() != nil && es.Incoming().TriggeringOrigin() != nil {
 		ret.pendingDependencies++
 	}
 	return ret
@@ -302,15 +303,17 @@ func newAnalyzer[T any, CP, SP, DP fmt.Stringer](
 	}
 	for idx, group := range groups {
 		tg := &traceGroup[T, CP, SP, DP]{
-			debugNamer:          a.debugNamer,
-			group:               group,
-			victims:             map[ElementarySpanner[T, CP, SP, DP]]struct{}{},
-			antagonists:         map[ElementarySpanner[T, CP, SP, DP]]struct{}{},
-			victimSelection:     trace.SelectSpans(t.Trace(), group.victimFinder),
-			antagonistSelection: trace.SelectSpans(t.Trace(), group.antagonistFinder),
+			debugNamer:  a.debugNamer,
+			group:       group,
+			victims:     map[ElementarySpanner[T, CP, SP, DP]]struct{}{},
+			antagonists: map[ElementarySpanner[T, CP, SP, DP]]struct{}{},
 		}
-		if group.victimFinder != nil {
-			tg.victimSelection = trace.SelectSpans(t.Trace(), group.victimFinder)
+		if group.victimSpanPattern != nil {
+			victimSpanFinder, err := traceparser.NewSpanFinder(group.victimSpanPattern, t.Trace())
+			if err != nil {
+				return nil, err
+			}
+			tg.victimSelection = trace.SelectSpans(victimSpanFinder)
 		} else if group.victimElementarySpansFn != nil {
 			ess, err := group.victimElementarySpansFn(t)
 			if err != nil {
@@ -323,8 +326,12 @@ func newAnalyzer[T any, CP, SP, DP fmt.Stringer](
 		} else {
 			return nil, fmt.Errorf("group '%s' has not defined a victim span finder or victim elementary span function", group.Name())
 		}
-		if group.antagonistFinder != nil {
-			tg.antagonistSelection = trace.SelectSpans(t.Trace(), group.antagonistFinder)
+		if group.antagonistSpanPattern != nil {
+			antagonistSpanFinder, err := traceparser.NewSpanFinder(group.antagonistSpanPattern, t.Trace())
+			if err != nil {
+				return nil, err
+			}
+			tg.antagonistSelection = trace.SelectSpans(antagonistSpanFinder)
 		} else if group.antagonistElementarySpansFn != nil {
 			ess, err := group.antagonistElementarySpansFn(t)
 			if err != nil {
@@ -376,15 +383,40 @@ func (a *analyzer[T, CP, SP, DP]) find(
 ) error {
 	lastTimeValid := false
 	var lastTime, nextTime T
-	var nextEndingRunning, nextStartingRunnable *antagonismElementarySpan[T, CP, SP, DP]
-	for a.running.Len() > 0 || a.runnable.Len() > 0 || nextEndingRunning != nil || nextStartingRunnable != nil {
+	// While any elementary spans remain in the running and/or runnable heaps,
+	// repeatedly handle the next pending event:
+	//  * If only `runnable` contains entries, or if the top of `runnable` starts
+	//    earlier than the top of `running` finishes, process the top of
+	//    `runnable``:
+	//    1) pop the next-starting runnable elementary span R from the top of
+	//       `runnable`;
+	//    2) advance `nextTime` to R.Start();
+	//    3) push R into `running`.
+	// * If only `running` contains entries, or if the top of `running` ends
+	//   earlier than the top of `runnable` starts, process the top of `running`:
+	//   1) pop the next-ending running elementary span R from the top of
+	//     `running`;
+	//   2) advance `nextTime` to R.End();
+	//   3) resolve all of R's outgoing dependencies.  If after this an
+	//      elementary span S on the other end of one of these dependencies has
+	//      no more pending dependencies, push S onto `runnable`.
+	// Next, if `lastTime` is valid, record antagonisms between all victim
+	// elementary spans in `runnable` and all antagonist elementary spans in
+	// `running`.
+	// Finally, set `lastTime` to `nextTime` and note that `lastTime` is valid.
+	// At each iteration when `lastTime` is valid, `nextTime - lastTime` is a
+	// potential *antagonism*, when all *victims* in `runnable` are *antagonised*
+	// by all *antagonists* in `running`.
+	for a.running.Len() > 0 || a.runnable.Len() > 0 {
+		var nextEndingRunning, nextStartingRunnable *antagonismElementarySpan[T, CP, SP, DP]
 		// Find the next ending elementary span in `running`, and the next starting
-		// one in `runnable`.
-		if nextEndingRunning == nil && a.running.Len() > 0 {
-			nextEndingRunning = heap.Pop(a.running).(*antagonismElementarySpan[T, CP, SP, DP])
+		// one in `runnable`.  Per https://pkg.go.dev/container/heap, element 0 is
+		// always the top of the heap.
+		if a.running.Len() > 0 {
+			nextEndingRunning = a.running.spanners[0].(*antagonismElementarySpan[T, CP, SP, DP])
 		}
-		if nextStartingRunnable == nil && a.runnable.Len() > 0 {
-			nextStartingRunnable = heap.Pop(a.runnable).(*antagonismElementarySpan[T, CP, SP, DP])
+		if a.runnable.Len() > 0 {
+			nextStartingRunnable = a.runnable.spanners[0].(*antagonismElementarySpan[T, CP, SP, DP])
 		}
 		var drawFromRunning bool
 		if nextEndingRunning != nil && nextStartingRunnable != nil {
@@ -398,8 +430,10 @@ func (a *analyzer[T, CP, SP, DP]) find(
 			return fmt.Errorf("expected at least one elementary span to be running or runnable, but none was")
 		}
 		if drawFromRunning {
+			heap.Pop(a.running)
 			nextTime = nextEndingRunning.es.End()
 		} else {
+			heap.Pop(a.runnable)
 			nextTime = nextStartingRunnable.es.Start()
 		}
 		if lastTimeValid && !a.comparator.Equal(lastTime, nextTime) {
@@ -432,24 +466,24 @@ func (a *analyzer[T, CP, SP, DP]) find(
 		return fmt.Errorf("After antagonism analysis, %d spans remain blocked, indicating causal errors in the trace", a.totalESs-a.retiredESs)
 	}
 	if a.backwardsDeps > 0 {
-		fmt.Printf("Warning: Trace had %d backwards dependency edges (i.e., effect preceded cause).  This can skew antagonism analysis.\n", a.backwardsDeps)
+		fmt.Printf("Trace had %d backwards dependency edges (i.e., effect preceded cause).  This can skew antagonism analysis.", a.backwardsDeps)
 	}
 	return nil
 }
 
-func (a *analyzer[T, CP, SP, DP]) setRunnable(aes *antagonismElementarySpan[T, CP, SP, DP]) error {
-	heap.Push(a.runnable, aes)
+func (a *analyzer[T, CP, SP, DP]) setRunnable(newlyRunnable *antagonismElementarySpan[T, CP, SP, DP]) error {
+	heap.Push(a.runnable, newlyRunnable)
 	for _, g := range a.traceGroups {
-		g.setVictim(aes)
+		g.setVictim(newlyRunnable)
 	}
 	return nil
 }
 
-func (a *analyzer[T, CP, SP, DP]) setRunning(nextStartingRunnable *antagonismElementarySpan[T, CP, SP, DP]) error {
-	heap.Push(a.running, nextStartingRunnable)
+func (a *analyzer[T, CP, SP, DP]) setRunning(newlyRunning *antagonismElementarySpan[T, CP, SP, DP]) error {
+	heap.Push(a.running, newlyRunning)
 	for _, g := range a.traceGroups {
-		g.unsetVictim(nextStartingRunnable)
-		g.setAntagonist(nextStartingRunnable)
+		g.unsetVictim(newlyRunning)
+		g.setAntagonist(newlyRunning)
 	}
 	return nil
 }
@@ -469,19 +503,17 @@ func (a *analyzer[T, CP, SP, DP]) resolveDependency(
 	return nil
 }
 
-func (a *analyzer[T, CP, SP, DP]) retire(
-	nextEndingRunning *antagonismElementarySpan[T, CP, SP, DP],
-) error {
+func (a *analyzer[T, CP, SP, DP]) retire(newlyRetired *antagonismElementarySpan[T, CP, SP, DP]) error {
 	a.retiredESs++
 	for _, g := range a.traceGroups {
-		g.retireAntagonist(nextEndingRunning)
+		g.retireAntagonist(newlyRetired)
 	}
-	if err := a.resolveDependency(nextEndingRunning.successor); err != nil {
+	if err := a.resolveDependency(newlyRetired.successor); err != nil {
 		return err
 	}
-	if nextEndingRunning.ElementarySpan().Outgoing() != nil {
-		for _, destES := range nextEndingRunning.ElementarySpan().Outgoing().Destinations() {
-			if a.comparator.Greater(nextEndingRunning.ElementarySpan().End(), destES.Start()) {
+	if newlyRetired.ElementarySpan().Outgoing() != nil {
+		for _, destES := range newlyRetired.ElementarySpan().Outgoing().Destinations() {
+			if a.comparator.Greater(newlyRetired.ElementarySpan().End(), destES.Start()) {
 				a.backwardsDeps++
 			}
 			if err := a.resolveDependency(a.aes[destES]); err != nil {

@@ -36,12 +36,11 @@ const (
 	Structural
 )
 
-// HierarchyTypeNames maps test HierarchyTypes to strings.
-var HierarchyTypeNames = map[trace.HierarchyType]string{
-	None:       "no",
-	Causal:     "causal",
-	Structural: "structural",
-}
+// HierarchyTypes defines test traces' valid  hierarchy types.
+var HierarchyTypes = trace.NewHierarchyTypes().
+	With(None, "none", "Span-only").
+	With(Structural, "structural", "structural").
+	With(Causal, "causal", "causal")
 
 // DependencyTypes supported in test traces.
 const (
@@ -50,24 +49,16 @@ const (
 	Signal
 )
 
-// DependencyTypeNames maps test DependencyTypes to strings.
-var DependencyTypeNames = map[trace.DependencyType]string{
-	trace.Call:   "call",
-	trace.Return: "return",
-	Spawn:        "spawn",
-	Send:         "send",
-	Signal:       "signal",
-}
+// DependencyTypes defines test traces' valid dependency types.
+var DependencyTypes = trace.NewDependencyTypes().
+	With(trace.Call, "call", "call").
+	With(trace.Return, "return", "return").
+	With(Spawn, "spawn", "spawn").
+	With(Send, "send", "send").
+	With(Signal, "signal", "signal")
 
 // StringPayload is a Span or Category payload that is a simple string.
 type StringPayload string
-
-// LiteralMatcher matches the provided literal path element name.
-func LiteralMatcher(
-	str string,
-) trace.PathElementMatcher[time.Duration, StringPayload, StringPayload, StringPayload] {
-	return trace.NewLiteralNameMatcher[time.Duration, StringPayload, StringPayload, StringPayload](str)
-}
 
 func (sp StringPayload) String() string {
 	return string(sp)
@@ -100,12 +91,12 @@ func (stn *stringTraceNamer) SpanUniqueID(
 	return span.Payload().String()
 }
 
-func (stn *stringTraceNamer) HierarchyTypeNames() map[trace.HierarchyType]string {
-	return HierarchyTypeNames
+func (stn *stringTraceNamer) HierarchyTypes() *trace.HierarchyTypes {
+	return HierarchyTypes
 }
 
-func (stn *stringTraceNamer) DependencyTypeNames() map[trace.DependencyType]string {
-	return DependencyTypeNames
+func (stn *stringTraceNamer) DependencyTypes() *trace.DependencyTypes {
+	return DependencyTypes
 }
 
 func (stn *stringTraceNamer) MomentString(t time.Duration) string {
@@ -123,7 +114,7 @@ type TraceBuilder struct {
 // testing.T.
 func NewTestingTraceBuilder(t *testing.T) *TraceBuilder {
 	return NewTraceBuilderWithErrorHandler(func(err error) {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	})
 }
 
@@ -170,14 +161,9 @@ func (tb *TraceBuilder) WithRootSpans(spans ...RootSpanFn) *TraceBuilder {
 	return tb
 }
 
-// OriginFn describes a function attaching an origin to a Dependency.
-type OriginFn func(
-	tb *TraceBuilder,
-	db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
-) error
-
-// DestinationFn describes a function attaching a destination to a Dependency.
-type DestinationFn func(
+// EndpointFn describes a function attaching an origin or destination to a
+// Dependency.
+type EndpointFn func(
 	tb *TraceBuilder,
 	db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 ) error
@@ -188,15 +174,24 @@ type DestinationFn func(
 func (tb *TraceBuilder) WithDependency(
 	dependencyType trace.DependencyType,
 	payload StringPayload,
-	originFn OriginFn,
-	destinationFns ...DestinationFn,
+	opts ...any,
 ) *TraceBuilder {
-	db := tb.trace.NewDependency(dependencyType, payload)
-	if err := originFn(tb, db); err != nil {
-		tb.err(err)
+	var options []trace.DependencyOption
+	var endpointFns []EndpointFn
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case trace.DependencyOption:
+			options = append(options, v)
+		case EndpointFn:
+			endpointFns = append(endpointFns, v)
+		default:
+			tb.err(fmt.Errorf("unrecognized WithDependency argument type %T", v))
+			return tb
+		}
 	}
-	for _, destinationFn := range destinationFns {
-		if err := destinationFn(tb, db); err != nil {
+	db := tb.trace.NewDependency(dependencyType, payload, options...)
+	for _, endpointFn := range endpointFns {
+		if err := endpointFn(tb, db); err != nil {
 			tb.err(err)
 		}
 	}
@@ -204,25 +199,40 @@ func (tb *TraceBuilder) WithDependency(
 }
 
 func (tb *TraceBuilder) findSpans(
-	pathMatchers []string,
+	pathEls []string,
 ) []trace.Span[time.Duration, StringPayload, StringPayload, StringPayload] {
-	sf, err := SpanFinderFromPattern(pathMatchers)
-	if err != nil {
-		tb.err(err)
-		return nil
+	var cursors []trace.Span[time.Duration, StringPayload, StringPayload, StringPayload]
+	if len(pathEls) == 0 {
+		return cursors
 	}
-	return sf.Find(tb.trace)
+	for _, s := range tb.trace.RootSpans() {
+		if s.Payload().String() == pathEls[0] {
+			cursors = append(cursors, s)
+		}
+	}
+	for _, pathEl := range pathEls[1:] {
+		var nextCursors []trace.Span[time.Duration, StringPayload, StringPayload, StringPayload]
+		for _, cursor := range cursors {
+			for _, child := range cursor.ChildSpans() {
+				if child.Payload().String() == pathEl {
+					nextCursors = append(nextCursors, child)
+				}
+			}
+		}
+		cursors = nextCursors
+	}
+	return cursors
 }
 
 // WithSuspend adds a suspend over the specified interval in the specified
 // span.
 func (tb *TraceBuilder) WithSuspend(
-	pathMatchers []string, start, end time.Duration,
+	pathEls []string, start, end time.Duration,
 	opts ...trace.SuspendOption,
 ) *TraceBuilder {
-	spans := tb.findSpans(pathMatchers)
+	spans := tb.findSpans(pathEls)
 	if len(spans) != 1 {
-		tb.err(fmt.Errorf("exactly one span must match the path patterns '%v' (got %d)", pathMatchers, len(spans)))
+		tb.err(fmt.Errorf("can't add suspend: exactly one span must match the path '%s' (got %d)", strings.Join(pathEls, "/"), len(spans)))
 		return tb
 	}
 	spans[0].Suspend(tb.trace.Comparator(), start, end, opts...)
@@ -232,17 +242,17 @@ func (tb *TraceBuilder) WithSuspend(
 // Origin declares the Span matching the provided path string, at the provided
 // time, to be the origin of a Dependency.
 func Origin(
-	pathMatchers []string,
+	pathEls []string,
 	start time.Duration,
-	opts ...trace.DependencyOption,
-) OriginFn {
+	opts ...trace.DependencyEndpointOption,
+) EndpointFn {
 	return func(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		spans := tb.findSpans(pathMatchers)
+		spans := tb.findSpans(pathEls)
 		if len(spans) != 1 {
-			return fmt.Errorf("exactly one span must match the path patterns '%v' (got %d)", pathMatchers, len(spans))
+			return fmt.Errorf("exactly one span must match the path '%s' (got %d)", strings.Join(pathEls, "/"), len(spans))
 		}
 		return db.SetOriginSpan(tb.trace.Comparator(), spans[0], start, opts...)
 	}
@@ -251,17 +261,17 @@ func Origin(
 // Destination declares the Span matching the provided path string, at the provided
 // time, to be a destination of a Dependency.
 func Destination(
-	pathMatchers []string,
+	pathEls []string,
 	end time.Duration,
-	opts ...trace.DependencyOption,
-) DestinationFn {
+	opts ...trace.DependencyEndpointOption,
+) EndpointFn {
 	return func(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		spans := tb.findSpans(pathMatchers)
+		spans := tb.findSpans(pathEls)
 		if len(spans) != 1 {
-			return fmt.Errorf("exactly one span must match the path pattern '%v' (got %d)", pathMatchers, len(spans))
+			return fmt.Errorf("exactly one span must match the path '%s' (got %d)", strings.Join(pathEls, "/"), len(spans))
 		}
 		return db.AddDestinationSpan(tb.trace.Comparator(), spans[0], end, opts...)
 	}
@@ -271,16 +281,16 @@ func Destination(
 // at the provided end time, to be a destination of a Dependency after a suspended
 // interval starting at the provided waitFrom time.
 func DestinationAfterWait(
-	pathMatchers []string,
+	pathEls []string,
 	waitFrom, end time.Duration,
-) DestinationFn {
+) EndpointFn {
 	return func(
 		tb *TraceBuilder,
 		db trace.Dependency[time.Duration, StringPayload, StringPayload, StringPayload],
 	) error {
-		spans := tb.findSpans(pathMatchers)
+		spans := tb.findSpans(pathEls)
 		if len(spans) != 1 {
-			return fmt.Errorf("exactly one span must match the path pattern '%v' (got %d)", pathMatchers, len(spans))
+			return fmt.Errorf("exactly one span must match the path '%s' (got %d)", strings.Join(pathEls, "/"), len(spans))
 		}
 		return db.AddDestinationSpanAfterWait(tb.trace.Comparator(), spans[0], waitFrom, end)
 	}
@@ -328,15 +338,15 @@ func Category(payload StringPayload, childCats ...CategoryFn) CategoryFn {
 // HierarchyType it should be found under in a Trace.
 type CategorySearchSpec struct {
 	ht      trace.HierarchyType
-	pathStr string
+	pathEls []string
 }
 
 // FindCategory specifies a parent Category (HierarchyType and path within
 // that hierarchy) for a root Span.
-func FindCategory(ht trace.HierarchyType, pathStr string) CategorySearchSpec {
+func FindCategory(ht trace.HierarchyType, pathEls ...string) CategorySearchSpec {
 	return CategorySearchSpec{
 		ht:      ht,
-		pathStr: pathStr,
+		pathEls: pathEls,
 	}
 }
 
@@ -351,20 +361,6 @@ type RootSpanFn func(tb *TraceBuilder) (
 	error,
 )
 
-// SpanFinderFromPattern returns a slice of PathElementMatchers formed by
-// splitting the provided path string on slashes, then creating a
-// LiteralNameMatcher for each path element.
-func SpanFinderFromPattern(spanFinderStrs []string) (
-	*trace.SpanFinder[time.Duration, StringPayload, StringPayload, StringPayload],
-	error,
-) {
-	pmp, err := trace.NewPathMatcherParser[time.Duration, StringPayload, StringPayload, StringPayload]()
-	if err != nil {
-		return nil, err
-	}
-	return pmp.ParseSpanFinderStr(&stringTraceNamer{}, trace.SpanOnlyHierarchyType, strings.Join(spanFinderStrs, ","))
-}
-
 // RootSpan defines a root Span, with the specified endpoints, payload,
 // parent Categories, and child Spans, for inclusion in a Trace.
 func RootSpan(
@@ -377,28 +373,27 @@ func RootSpan(
 		trace.Span[time.Duration, StringPayload, StringPayload, StringPayload], error) {
 		ret := tb.trace.NewRootSpan(start, end, payload)
 		for _, childSpan := range childSpans {
-			if _, err := childSpan(tb.trace, ret); err != nil {
+			if err := childSpan(tb.trace, ret); err != nil {
 				return nil, err
 			}
-		}
-		pmp, err := trace.NewPathMatcherParser[time.Duration, StringPayload, StringPayload, StringPayload]()
-		if err != nil {
-			return nil, err
 		}
 		for _, parentCat := range parentCategories {
-			matchers, err := pmp.ParsePathMatcherStr(parentCat.pathStr)
-			if err != nil {
-				return nil, err
+			var cursor trace.Category[time.Duration, StringPayload, StringPayload, StringPayload]
+			pool := tb.trace.RootCategories(parentCat.ht)
+			for _, pathEl := range parentCat.pathEls {
+				cursor = nil
+				for _, cat := range pool {
+					if cat.Payload().String() == pathEl {
+						cursor = cat
+						break
+					}
+				}
+				if cursor == nil {
+					return nil, fmt.Errorf("failed to find parent category at %s", strings.Join(parentCat.pathEls, "/"))
+				}
+				pool = cursor.ChildCategories()
 			}
-			cats := trace.FindCategories[time.Duration, StringPayload, StringPayload, StringPayload](
-				tb.trace, tb.trace.DefaultNamer(),
-				parentCat.ht,
-				[][]trace.PathElementMatcher[time.Duration, StringPayload, StringPayload, StringPayload]{matchers},
-			)
-			if len(cats) != 1 {
-				return nil, fmt.Errorf("exactly one category must match the path pattern '%s' (got %d)", parentCat.pathStr, len(cats))
-			}
-			if err := cats[0].AddRootSpan(ret); err != nil {
+			if err := cursor.AddRootSpan(ret); err != nil {
 				return nil, err
 			}
 		}
@@ -406,14 +401,11 @@ func RootSpan(
 	}
 }
 
-// SpanFn describes a function declaring a child Span.
+// SpanFn describes a function declaring a child Span or Mark.
 type SpanFn func(
 	trace trace.Trace[time.Duration, StringPayload, StringPayload, StringPayload],
 	parent trace.Span[time.Duration, StringPayload, StringPayload, StringPayload],
-) (
-	trace.Span[time.Duration, StringPayload, StringPayload, StringPayload],
-	error,
-)
+) error
 
 // Span defines a child Span, with the specified endpoints, payload,
 // and child Spans, for inclusion in a Trace.
@@ -425,19 +417,31 @@ func Span(
 	return func(
 		t trace.Trace[time.Duration, StringPayload, StringPayload, StringPayload],
 		parent trace.Span[time.Duration, StringPayload, StringPayload, StringPayload],
-	) (
-		trace.Span[time.Duration, StringPayload, StringPayload, StringPayload],
-		error,
-	) {
+	) error {
+
 		ret, err := parent.NewChildSpan(t.Comparator(), start, end, payload)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, childSpan := range childSpans {
-			if _, err := childSpan(t, ret); err != nil {
-				return nil, err
+			if err := childSpan(t, ret); err != nil {
+				return err
 			}
 		}
-		return ret, nil
+		return nil
+	}
+}
+
+// Mark defines a mark at the specified moment and with the provided label
+// within its parent Span.
+func Mark(
+	label string,
+	at time.Duration,
+) SpanFn {
+	return func(
+		t trace.Trace[time.Duration, StringPayload, StringPayload, StringPayload],
+		parent trace.Span[time.Duration, StringPayload, StringPayload, StringPayload],
+	) error {
+		return parent.Mark(t.Comparator(), label, at)
 	}
 }

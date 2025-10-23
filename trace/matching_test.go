@@ -26,44 +26,29 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-func matchLiteralName(lit string) PathElementMatcher[time.Duration, payload, payload, payload] {
-	return NewLiteralNameMatcher[time.Duration, payload, payload, payload](lit)
-}
-
 func strs(strs ...string) []string {
 	return strs
 }
 
-func literalNameMatchers(path ...string) []PathElementMatcher[time.Duration, payload, payload, payload] {
-	matchers := make([]PathElementMatcher[time.Duration, payload, payload, payload], len(path))
+func literalNameMatchers(path ...string) []PathElementMatcher {
+	matchers := make([]PathElementMatcher, len(path))
 	for idx, pathEl := range path {
-		matchers[idx] = matchLiteralName(pathEl)
+		matchers[idx] = NewLiteralNameMatcher(pathEl)
 	}
 	return matchers
 }
 
-func matchLiteralID(lit string) PathElementMatcher[time.Duration, payload, payload, payload] {
-	return NewLiteralIDMatcher[time.Duration, payload, payload, payload](lit)
-}
-
-func literalIDMatchers(path ...string) []PathElementMatcher[time.Duration, payload, payload, payload] {
-	matchers := make([]PathElementMatcher[time.Duration, payload, payload, payload], len(path))
+func literalIDMatchers(path ...string) []PathElementMatcher {
+	matchers := make([]PathElementMatcher, len(path))
 	for idx, pathEl := range path {
-		matchers[idx] = matchLiteralID(pathEl)
+		matchers[idx] = NewLiteralIDMatcher(pathEl)
 	}
 	return matchers
 }
 
-func pathMatcher(matchers ...PathElementMatcher[time.Duration, payload, payload, payload]) []PathElementMatcher[time.Duration, payload, payload, payload] {
+func pathMatcher(matchers ...PathElementMatcher) []PathElementMatcher {
 	return matchers
 }
-
-func matchers(matchers ...[]PathElementMatcher[time.Duration, payload, payload, payload]) [][]PathElementMatcher[time.Duration, payload, payload, payload] {
-	return matchers
-}
-
-var matchGlobstar = Globstar[time.Duration, payload, payload, payload]()
-var matchStar = Star[time.Duration, payload, payload, payload]()
 
 func testTrace1(t *testing.T) Trace[time.Duration, payload, payload, payload] {
 	t.Helper()
@@ -71,24 +56,25 @@ func testTrace1(t *testing.T) Trace[time.Duration, payload, payload, payload] {
 	a := trace.NewRootSpan(0, 100, "a")
 	ab, err := a.NewChildSpan(DurationComparator, 10, 40, "b")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 	_, err = ab.NewChildSpan(DurationComparator, 20, 30, "c")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 	ac, err := a.NewChildSpan(DurationComparator, 50, 90, "c")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 	acd, err := ac.NewChildSpan(DurationComparator, 60, 80, "d")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
 	_, err = acd.NewChildSpan(DurationComparator, 65, 75, "e")
 	if err != nil {
-		t.Fatalf(err.Error())
+		t.Fatal(err.Error())
 	}
+	trace.NewRootSpan(0, 50, "f")
 	return trace
 }
 
@@ -97,37 +83,34 @@ func TestFindSpans(t *testing.T) {
 
 	for _, test := range []struct {
 		description          string
-		matchers             [][]PathElementMatcher[time.Duration, payload, payload, payload]
+		matchers             []PathElementMatcher
+		spanFilter           SpanFilter[time.Duration, payload, payload, payload]
 		wantMatchingSpansStr string
 	}{{
 		description: "find span by literal name path",
-		matchers:    matchers(literalNameMatchers("a", "b", "c")),
+		matchers:    literalNameMatchers("a", "b", "c"),
 		wantMatchingSpansStr: `
 c: 20ns-30ns`,
 	}, {
 		description: "find span by literal ID path",
-		matchers:    matchers(literalIDMatchers("id:a", "id:b", "id:c")),
+		matchers:    literalIDMatchers("id:a", "id:b", "id:c"),
 		wantMatchingSpansStr: `
 c: 20ns-30ns`,
 	}, {
 		description: "find **/c",
-		matchers: matchers(
-			pathMatcher(
-				matchGlobstar,
-				matchLiteralName("c"),
-			),
+		matchers: pathMatcher(
+			Globstar,
+			NewLiteralNameMatcher("c"),
 		),
 		wantMatchingSpansStr: `
 c: 50ns-90ns
 c: 20ns-30ns`,
 	}, {
 		description: "find a/c/**",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchLiteralName("c"),
-				matchGlobstar,
-			),
+		matchers: pathMatcher(
+			NewLiteralNameMatcher("a"),
+			NewLiteralNameMatcher("c"),
+			Globstar,
 		),
 		wantMatchingSpansStr: `
 c: 50ns-90ns
@@ -135,20 +118,29 @@ d: 60ns-80ns
 e: 65ns-75ns`,
 	}, {
 		description: "find a/*/*",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchStar,
-				matchStar,
-			),
+		matchers: pathMatcher(
+			NewLiteralNameMatcher("a"),
+			Star,
+			Star,
 		),
 		wantMatchingSpansStr: `
 c: 20ns-30ns
 d: 60ns-80ns`,
+	}, {
+		description: "find ** under root span f",
+		matchers: pathMatcher(
+			Globstar,
+		),
+		spanFilter: func(s Span[time.Duration, payload, payload, payload]) (include, prune bool) {
+			filtered := s.ParentSpan() == nil && s.Payload() == "f"
+			return filtered, !filtered
+		},
+		wantMatchingSpansStr: `
+f: 0s-50ns`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			matchingSpans := findSpans(trace, &testNamer{}, test.matchers, SpanOnlyHierarchyType, nil)
-			gotMatchingSpansStrs := []string{}
+			matchingSpans := findSpans(trace, trace.DefaultNamer(), test.spanFilter, test.matchers, SpanOnlyHierarchyType, nil)
+			var gotMatchingSpansStrs []string
 			for _, span := range matchingSpans {
 				gotMatchingSpansStrs = append(
 					gotMatchingSpansStrs,
@@ -174,53 +166,45 @@ func TestFindCategories(t *testing.T) {
 
 	for _, test := range []struct {
 		description         string
-		matchers            [][]PathElementMatcher[time.Duration, payload, payload, payload]
+		matchers            []PathElementMatcher
 		wantMatchingCatsStr string
 	}{{
 		description: "find category by literal path",
-		matchers: [][]PathElementMatcher[time.Duration, payload, payload, payload]{
-			{
-				matchLiteralName("a"),
-				matchLiteralName("b"),
-				matchLiteralName("c"),
-			},
+		matchers: []PathElementMatcher{
+			NewLiteralNameMatcher("a"),
+			NewLiteralNameMatcher("b"),
+			NewLiteralNameMatcher("c"),
 		},
 		wantMatchingCatsStr: `a/b/c`,
 	}, {
 		description: "find **/c",
-		matchers: [][]PathElementMatcher[time.Duration, payload, payload, payload]{
-			{
-				Globstar[time.Duration, payload, payload, payload](),
-				matchLiteralName("c"),
-			},
+		matchers: []PathElementMatcher{
+			Globstar,
+			NewLiteralNameMatcher("c"),
 		},
 		wantMatchingCatsStr: `a/c, a/b/c`,
 	}, {
 		description: "find a/c/**",
-		matchers: [][]PathElementMatcher[time.Duration, payload, payload, payload]{
-			{
-				matchLiteralName("a"),
-				matchLiteralName("c"),
-				Globstar[time.Duration, payload, payload, payload](),
-			},
+		matchers: []PathElementMatcher{
+			NewLiteralNameMatcher("a"),
+			NewLiteralNameMatcher("c"),
+			Globstar,
 		},
 		wantMatchingCatsStr: `a/c, a/c/d, a/c/d/e`,
 	}, {
 		description: "find a/*/*",
-		matchers: [][]PathElementMatcher[time.Duration, payload, payload, payload]{
-			{
-				matchLiteralName("a"),
-				Star[time.Duration, payload, payload, payload](),
-				Star[time.Duration, payload, payload, payload](),
-			},
+		matchers: []PathElementMatcher{
+			NewLiteralNameMatcher("a"),
+			Star,
+			Star,
 		},
 		wantMatchingCatsStr: `a/b/c, a/c/d`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			matchingCats := FindCategories(trace, &testNamer{}, 0, test.matchers)
-			gotMatchingCatsStrs := []string{}
+			matchingCats := findCategories[time.Duration, payload, payload, payload](trace, &testNamer{}, 0, test.matchers)
+			var gotMatchingCatsStrs []string
 			for _, cat := range matchingCats {
-				path := []string{}
+				var path []string
 				for cat != nil {
 					path = append(path, cat.Payload().String())
 					cat = cat.Parent()

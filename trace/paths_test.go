@@ -32,8 +32,8 @@ func findSpan(
 ) Span[time.Duration, payload, payload, payload] {
 	t.Helper()
 	ms := literalNameMatchers(path...)
-	sf := NewSpanFinder(namer).WithSpanMatchers(ms)
-	spans := sf.Find(trace)
+	sfp := NewSpanPattern(SpanMatchers(ms))
+	spans := NewSpanFinder(sfp, trace).FindSpans()
 	if len(spans) != 1 {
 		t.Fatalf("expected matchers to match exactly one span; matched %d", len(spans))
 	}
@@ -73,8 +73,8 @@ func TestSpanPaths(t *testing.T) {
 		wantUniquePath:  strs("id:a", "id:c", "id:d", "id:e"),
 	}} {
 		t.Run(strings.Join(test.wantUniquePath, "/"), func(t *testing.T) {
-			gotDisplayPath := GetSpanDisplayPath(test.span, &testNamer{})
-			gotUniquePath := GetSpanUniquePath(test.span, &testNamer{})
+			gotDisplayPath := GetSpanDisplayPath[time.Duration, payload, payload, payload](test.span, &testNamer{})
+			gotUniquePath := GetSpanUniquePath[time.Duration, payload, payload, payload](test.span, &testNamer{})
 			if diff := cmp.Diff(test.wantDisplayPath, gotDisplayPath); diff != "" {
 				t.Errorf("Got display path %v, diff (-want +got) %s", gotDisplayPath, diff)
 			}
@@ -124,8 +124,8 @@ func TestCategoryPaths(t *testing.T) {
 		wantUniquePath:  strs("a", "c", "d", "e"),
 	}} {
 		t.Run(strings.Join(test.wantUniquePath, "/"), func(t *testing.T) {
-			gotDisplayPath := GetCategoryDisplayPath(test.category, &testNamer{})
-			gotUniquePath := GetCategoryUniquePath(test.category, &testNamer{})
+			gotDisplayPath := GetCategoryDisplayPath[time.Duration, payload, payload, payload](test.category, &testNamer{})
+			gotUniquePath := GetCategoryUniquePath[time.Duration, payload, payload, payload](test.category, &testNamer{})
 			if diff := cmp.Diff(test.wantDisplayPath, gotDisplayPath); diff != "" {
 				t.Errorf("Got display path %v, diff (-want +got) %s", gotDisplayPath, diff)
 			}

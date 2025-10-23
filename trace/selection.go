@@ -20,37 +20,14 @@ import (
 	"fmt"
 )
 
-// Returns a slice containing all of the Spans within the provided Trace.
-func allSpans[T any, CP, SP, DP fmt.Stringer](
-	t Trace[T, CP, SP, DP],
-) []Span[T, CP, SP, DP] {
-	ret := []Span[T, CP, SP, DP]{}
-	var visit func(spans []Span[T, CP, SP, DP])
-	visit = func(spans []Span[T, CP, SP, DP]) {
-		ret = append(ret, spans...)
-		for _, span := range spans {
-			visit(span.ChildSpans())
-		}
-	}
-	rootSpans := make([]Span[T, CP, SP, DP], len(t.RootSpans()))
-	for idx, rootSpan := range t.RootSpans() {
-		rootSpans[idx] = rootSpan
-	}
-	visit(rootSpans)
-	return ret
-}
-
-// SelectSpans uses the provided set of matchers, and the provided Namer,
-// to generate the returned SpanSelection from the provided Trace.
+// SelectSpans uses the provided SpanFinder to generate the returned
+// SpanSelection from the provided Trace.
 func SelectSpans[T any, CP, SP, DP fmt.Stringer](
-	t Trace[T, CP, SP, DP],
-	spanFinder *SpanFinder[T, CP, SP, DP],
+	spanFinder SpanFinder[T, CP, SP, DP],
 ) *SpanSelection[T, CP, SP, DP] {
-	ret := &SpanSelection[T, CP, SP, DP]{
-		t: t,
-	}
+	ret := &SpanSelection[T, CP, SP, DP]{}
 	if spanFinder != nil {
-		spans := spanFinder.Find(t)
+		spans := spanFinder.FindSpans()
 		ret.selectedSpans = make(map[Span[T, CP, SP, DP]]struct{}, len(spans))
 		if len(spans) > 0 {
 			for _, span := range spans {
@@ -63,7 +40,6 @@ func SelectSpans[T any, CP, SP, DP fmt.Stringer](
 
 // SpanSelection manages a set of Spans selected from a Trace.
 type SpanSelection[T any, CP, SP, DP fmt.Stringer] struct {
-	t             Trace[T, CP, SP, DP]
 	selectedSpans map[Span[T, CP, SP, DP]]struct{} // If nil, selects all.
 }
 
@@ -76,11 +52,9 @@ func (ss *SpanSelection[T, CP, SP, DP]) Includes(span Span[T, CP, SP, DP]) bool 
 	return found
 }
 
-// Spans returns the slice of selected Spans.
+// Spans returns a slice of all selected Spans.  The order of the returned
+// slice is not deterministic.
 func (ss *SpanSelection[T, CP, SP, DP]) Spans() []Span[T, CP, SP, DP] {
-	if ss.selectedSpans == nil {
-		return allSpans(ss.t)
-	}
 	ret := make([]Span[T, CP, SP, DP], 0, len(ss.selectedSpans))
 	for selectedSpan := range ss.selectedSpans {
 		ret = append(ret, selectedSpan)
@@ -93,7 +67,7 @@ func allCategories[T any, CP, SP, DP fmt.Stringer](
 	t Trace[T, CP, SP, DP],
 	ht HierarchyType,
 ) []Category[T, CP, SP, DP] {
-	ret := []Category[T, CP, SP, DP]{}
+	var ret []Category[T, CP, SP, DP]
 	var visit func(categories []Category[T, CP, SP, DP])
 	visit = func(categories []Category[T, CP, SP, DP]) {
 		ret = append(ret, categories...)
@@ -112,21 +86,17 @@ func allCategories[T any, CP, SP, DP fmt.Stringer](
 // SelectCategories uses the provided set of matchers, and the provided Namer,
 // to generate the returned CategorySelection from the provided Trace.
 func SelectCategories[T any, CP, SP, DP fmt.Stringer](
-	t Trace[T, CP, SP, DP],
-	namer Namer[T, CP, SP, DP],
-	ht HierarchyType,
-	matchers [][]PathElementMatcher[T, CP, SP, DP],
+	spanFinder SpanFinder[T, CP, SP, DP],
+	opts ...FindCategoryOption,
 ) *CategorySelection[T, CP, SP, DP] {
-	ret := &CategorySelection[T, CP, SP, DP]{
-		t: t,
-	}
-	categories := FindCategories(t, namer, ht, matchers)
-	if len(matchers) > 0 {
+	ret := &CategorySelection[T, CP, SP, DP]{}
+	if spanFinder != nil {
+		categories := spanFinder.FindCategories(opts...)
 		ret.selectedCategories = make(map[Category[T, CP, SP, DP]]struct{}, len(categories))
-	}
-	if len(categories) > 0 {
-		for _, category := range categories {
-			ret.selectedCategories[category] = struct{}{}
+		if len(categories) > 0 {
+			for _, category := range categories {
+				ret.selectedCategories[category] = struct{}{}
+			}
 		}
 	}
 	return ret
@@ -162,15 +132,16 @@ func (cs *CategorySelection[T, CP, SP, DP]) Categories(ht HierarchyType) []Categ
 
 // SelectDependencies uses the provided set of origin and destination Span
 // matchers, the provided set of matching DependencyTypes, and the provided
-// Namer to generate the returned DependencySelection from the provided Trace.
+// Trace's default Namer to generate the returned DependencySelection from the
+// provided Trace.
 func SelectDependencies[T any, CP, SP, DP fmt.Stringer](
 	t Trace[T, CP, SP, DP],
-	originSpanFinder, destinationSpanFinder *SpanFinder[T, CP, SP, DP],
+	originSpanFinder, destinationSpanFinder SpanFinder[T, CP, SP, DP],
 	matchingDependencyTypes ...DependencyType,
 ) *DependencySelection[T, CP, SP, DP] {
 	ret := &DependencySelection[T, CP, SP, DP]{
-		OriginSelection:      SelectSpans(t, originSpanFinder),
-		DestinationSelection: SelectSpans(t, destinationSpanFinder),
+		OriginSelection:      SelectSpans(originSpanFinder),
+		DestinationSelection: SelectSpans(destinationSpanFinder),
 	}
 	if len(matchingDependencyTypes) == 0 {
 		matchingDependencyTypes = t.DependencyTypes()

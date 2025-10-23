@@ -56,8 +56,11 @@ func (td *transformingDependency[T, CP, SP, DP]) isOriginalDestinationDeleted(
 	return true
 }
 
-func (td *transformingDependency[T, CP, SP, DP]) setOrigin(tes elementarySpanTransformer[T, CP, SP, DP]) error {
-	return td.new.SetOriginElementarySpan(tes.getTransformed())
+func (td *transformingDependency[T, CP, SP, DP]) setOrigin(
+	comparator trace.Comparator[T],
+	tes elementarySpanTransformer[T, CP, SP, DP],
+) error {
+	return td.new.SetOriginElementarySpan(comparator, tes.getTransformed())
 }
 
 func (td *transformingDependency[T, CP, SP, DP]) addDestination(
@@ -90,7 +93,7 @@ func newTransformingDependency[T any, CP, SP, DP fmt.Stringer](
 		included := true
 		for _, adr := range tt.appliedTransformations().appliedDependencyRemovals {
 			if adr.dependencySelection.IncludesDependencyType(original.DependencyType()) &&
-				adr.dependencySelection.IncludesOriginSpan(original.Origin().Span()) &&
+				adr.dependencySelection.IncludesOriginSpan(original.TriggeringOrigin().Span()) &&
 				adr.dependencySelection.IncludesDestinationSpan(originalDestination.Span()) {
 				included = false
 				break
@@ -109,7 +112,7 @@ func newTransformingDependency[T any, CP, SP, DP fmt.Stringer](
 	}
 	ret.new = tt.newMutableDependency(original)
 	for _, adm := range tt.appliedTransformations().appliedDependencyModifications {
-		if !adm.dependencySelection.IncludesOriginSpan(original.Origin().Span()) ||
+		if !adm.dependencySelection.IncludesOriginSpan(original.TriggeringOrigin().Span()) ||
 			!adm.dependencySelection.IncludesDependencyType(original.DependencyType()) {
 			continue
 		}

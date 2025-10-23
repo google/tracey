@@ -28,62 +28,84 @@ import (
 func TestTracePositionFinding(t *testing.T) {
 	tr := testTrace1(t)
 	for _, test := range []struct {
-		description     string
-		trace           Trace[time.Duration, payload, payload, payload]
-		spanFinder      *SpanFinder[time.Duration, payload, payload, payload]
-		fractionThrough float64
-		wantESs         string
+		description            string
+		trace                  Trace[time.Duration, payload, payload, payload]
+		spanFinderPattern      *SpanPattern
+		fractionThrough        float64
+		multiplePositionPolicy MultiplePositionPolicy
+		wantESs                string
 	}{{
 		description: "a/b @100%",
 		trace:       testTrace1(t),
-		spanFinder: NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(literalNameMatchers("a", "b"))...,
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(literalNameMatchers("a", "b")),
 		),
 		fractionThrough: 1.0,
-		wantESs:         `a/b @30ns-40ns`,
+		wantESs:         `a/b 30ns-40ns @40ns`,
 	}, {
 		description: "**/c @0%",
 		trace:       testTrace1(t),
-		spanFinder: NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(pathMatcher(matchGlobstar, matchLiteralName("c")))...,
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(pathMatcher(Globstar, NewLiteralNameMatcher("c"))),
 		),
 		fractionThrough: 0.0,
-		wantESs: `a/c @50ns-60ns
-a/b/c @20ns-30ns`,
+		wantESs: `a/c 50ns-60ns @50ns
+a/b/c 20ns-30ns @20ns`,
+	}, {
+		description: "**/c @0% earliest",
+		trace:       testTrace1(t),
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(pathMatcher(Globstar, NewLiteralNameMatcher("c"))),
+		),
+		fractionThrough:        0.0,
+		multiplePositionPolicy: EarliestMatchingPosition,
+		wantESs:                `a/b/c 20ns-30ns @20ns`,
+	}, {
+		description: "**/c @0% latest",
+		trace:       testTrace1(t),
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(pathMatcher(Globstar, NewLiteralNameMatcher("c"))),
+		),
+		fractionThrough:        0.0,
+		multiplePositionPolicy: LatestMatchingPosition,
+		wantESs:                `a/c 50ns-60ns @50ns`,
 	}, {
 		description: "**/d @30%",
 		trace:       testTrace1(t),
-		spanFinder: NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(pathMatcher(matchGlobstar, matchLiteralName("d")))...,
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(pathMatcher(Globstar, NewLiteralNameMatcher("d"))),
 		),
 		fractionThrough: 0.3,
-		wantESs:         `a/c/d @60ns-65ns`,
+		wantESs:         `a/c/d 60ns-65ns @63ns`,
 	}, {
 		description: "**/d @70%",
 		trace:       testTrace1(t),
-		spanFinder: NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(pathMatcher(matchGlobstar, matchLiteralName("d")))...,
+		spanFinderPattern: NewSpanPattern(
+			SpanMatchers(pathMatcher(Globstar, NewLiteralNameMatcher("d"))),
 		),
 		fractionThrough: 0.7,
-		wantESs:         `a/c/d @75ns-80ns`,
+		wantESs:         `a/c/d 75ns-80ns @76ns`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			pos := NewPosition(test.spanFinder, test.fractionThrough)
-			ess := pos.Find(tr)
+			pp := NewSpanFractionPositionPattern(test.fractionThrough, test.multiplePositionPolicy)
+			esps := NewPositionFinder(
+				pp,
+				NewSpanFinder(test.spanFinderPattern, tr),
+			).FindPositions()
 			var gotESsStrs []string
-			for _, es := range ess {
+			for _, esp := range esps {
 				gotESsStrs = append(
 					gotESsStrs,
 					fmt.Sprintf(
-						"%s @%v-%v",
+						"%s %v-%v @%v",
 						strings.Join(
-							GetSpanDisplayPath(
-								es.Span(),
+							GetSpanDisplayPath[time.Duration, payload, payload, payload](
+								esp.ElementarySpan.Span(),
 								&testNamer{},
 							),
 							"/",
 						),
-						es.Start(), es.End(),
+						esp.ElementarySpan.Start(), esp.ElementarySpan.End(), esp.At,
 					),
 				)
 			}

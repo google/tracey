@@ -95,14 +95,15 @@ import (
 	"fmt"
 
 	"github.com/google/tracey/trace"
+	traceparser "github.com/google/tracey/trace/parser"
 )
 
 // A trace-independent specification for a particular dependency transform
 // (i.e., changing dependency scheduling time.)
 type modifyDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP]
-	matchingDependencyTypes                 []trace.DependencyType
-	durationScalingFactor                   float64
+	originSpanPattern, destinationSpanPattern *traceparser.SpanPattern
+	matchingDependencyTypes                   []trace.DependencyType
+	durationScalingFactor                     float64
 
 	mayShrinkIfNotOriginallyBlocking bool
 	mayShrinkToOriginOffset          float64
@@ -117,10 +118,19 @@ type appliedDependencyModifications[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular span transform
 // (i.e., changing span start time or duration.)
 type modifySpanTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	spanFinder *trace.SpanFinder[T, CP, SP, DP]
+	spanPattern *traceparser.SpanPattern
 
 	hasDurationScalingFactor bool
 	durationScalingFactor    float64
+
+	hasDurationDelta    bool
+	durationDeltaString string
+
+	hasUpperDurationCap    bool
+	upperDurationCapString string
+
+	hasLowerDurationCap    bool
+	lowerDurationCapString string
 
 	startsAsEarlyAsPossible bool
 }
@@ -134,8 +144,8 @@ type appliedSpanModifications[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular added-dependency
 // transform.
 type addDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originPosition, destinationPosition *trace.Position[T, CP, SP, DP]
-	dependencyType                      trace.DependencyType
+	originPositionPattern, destinationPositionPattern *traceparser.PositionPattern
+	dependencyType                                    trace.DependencyType
 	// The scheduling delay of the added dependency.  Should be the output of
 	// Comparator[T].Diff().
 	schedulingDelay float64
@@ -146,7 +156,7 @@ type addDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
 type appliedDependencyAdditions[T any, CP, SP, DP fmt.Stringer] struct {
 	adt                        *addDependencyTransform[T, CP, SP, DP]
 	originSpan                 trace.Span[T, CP, SP, DP]
-	selectedDestinationSpans   *trace.SpanSelection[T, CP, SP, DP]
+	destinationSelection       *trace.SpanSelection[T, CP, SP, DP]
 	dep                        trace.MutableDependency[T, CP, SP, DP]
 	destinationsByOriginalSpan map[trace.Span[T, CP, SP, DP]]elementarySpanTransformer[T, CP, SP, DP]
 }
@@ -154,11 +164,11 @@ type appliedDependencyAdditions[T any, CP, SP, DP fmt.Stringer] struct {
 // A trace-independent specification for a particular removed-dependency
 // transform.
 type removeDependencyTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	originSpanFinder, destinationSpanFinder *trace.SpanFinder[T, CP, SP, DP]
-	matchingDependencyTypes                 []trace.DependencyType
+	originSpanPattern, destinationSpanPattern *traceparser.SpanPattern
+	matchingDependencyTypes                   []trace.DependencyType
 }
 
-// A removed-Depenency transform applied to a particular Trace.
+// A removed-Dependency transform applied to a particular Trace.
 type appliedDependencyRemovals[T any, CP, SP, DP fmt.Stringer] struct {
 	rdt                 *removeDependencyTransform[T, CP, SP, DP]
 	dependencySelection *trace.DependencySelection[T, CP, SP, DP]
@@ -180,7 +190,7 @@ type SpanGater[T any, CP, SP, DP fmt.Stringer] interface {
 
 // A trace-independent specification for a particular gated-span transform.
 type gatedSpanTransform[T any, CP, SP, DP fmt.Stringer] struct {
-	spanFinder *trace.SpanFinder[T, CP, SP, DP]
+	spanPattern *traceparser.SpanPattern
 
 	spanGaterFn func() SpanGater[T, CP, SP, DP]
 }
@@ -232,7 +242,7 @@ type dependencyTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	// Dependency.
 	isOriginalDestinationDeleted(originalDestination trace.ElementarySpan[T, CP, SP, DP]) bool
 	// Sets the Dependency's transformed origin.
-	setOrigin(est elementarySpanTransformer[T, CP, SP, DP]) error
+	setOrigin(comparator trace.Comparator[T], est elementarySpanTransformer[T, CP, SP, DP]) error
 	// Add a transformed destination to the Dependency.
 	addDestination(
 		originalDestination trace.ElementarySpan[T, CP, SP, DP],
@@ -254,17 +264,24 @@ type elementarySpanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	// Signals the ElementarySpan that all its incoming Dependencies have been
 	// added (via set{Original, New}IncomingDependency()).
 	allIncomingDependenciesAdded()
-	// Updates the start point of the ElementarySpan.  An ElementarySpan's
-	// default start point is either its original start point or the adjusted
-	// start point of any applicable span modification, whichever is earlier.
-	// An ElementarySpan's ultimate start point is the latest of its default
-	// start point and all updated start points it received.
-	updateStart(point T)
+	// Updates the non-dependency start time: the original or adjusted span start
+	// time, if the ElementarySpan is span-initial, or the end of the
+	// ElementarySpan's predecessor once it's scheduled.
+	updateNonDependencyStart(point T)
+	// Updates the ElementarySpan's incoming dependency start time.  If the
+	// dependency has multiple origins, chooseEarliest dictates whether the
+	// ElementarySpan's incoming dependencies will be resolved at the earliest
+	// origin's resolution or at the latest origin's resolution.
+	updateIncomingDependencyResolved(point T, chooseEarliest bool)
+
+	originalDuration() float64
+	// Sets the new (i.e., transformed) duration of the elementary span.
+	setNewDuration(newDuration float64)
 	// Sets the ElementarySpan's outgoing dependency following the provided
 	// original ElementarySpan's outgoing dependency
 	setOriginalOutgoingDependency(
 		originalOutgoingDependency trace.Dependency[T, CP, SP, DP],
-	) error
+	)
 	// Sets the ElementarySpan's incoming dependency following the provided
 	// original ElementarySpan's incoming dependency
 	setOriginalIncomingDependency(
@@ -273,7 +290,9 @@ type elementarySpanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	) error
 	// Sets the ElementarySpan's outgoing dependency following the provided
 	// Dependency addition.
-	setNewOutgoingDependency(outgoingADA *appliedDependencyAdditions[T, CP, SP, DP]) error
+	setNewOutgoingDependency(
+		outgoingADA *appliedDependencyAdditions[T, CP, SP, DP],
+	) error
 	// Sets the ElementarySpan's incoming dependency following the provided
 	// Dependency addition.
 	setNewIncomingDependency(incomingADA *appliedDependencyAdditions[T, CP, SP, DP]) error
@@ -281,8 +300,6 @@ type elementarySpanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	// Schedules the ElementarySpan, resolving its end time and all of its
 	// outgoing Dependencies.
 	schedule() error
-	// Returns the initial start time of the ElementarySpan.
-	start() T
 }
 
 // The external interface of a transformingSpan -- a Span in the process of
@@ -293,8 +310,6 @@ type spanTransformer[T any, CP, SP, DP fmt.Stringer] interface {
 	original() trace.Span[T, CP, SP, DP]
 	// Returns the Span's ElementarySpans.
 	elementarySpans() []elementarySpanTransformer[T, CP, SP, DP]
-	// Returns the span modifications that apply to the Span.
-	spanModifications() []*modifySpanTransform[T, CP, SP, DP]
 }
 
 // The external interface of a transformingTrace -- a Trace in the process of

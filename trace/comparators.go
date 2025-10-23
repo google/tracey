@@ -16,7 +16,10 @@
 
 package trace
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 type comparatorBase[T any] interface {
 	// Returns the difference between the two arguments (e.g., a-b) as a float64.
@@ -28,6 +31,10 @@ type comparatorBase[T any] interface {
 	Diff(a, b T) float64
 	// Returns the provided magnitude, as provided by Diff(), added to a.
 	Add(a T, magnitude float64) T
+	// Returns the duration (diff) value represented by the provided string.
+	DurationFromString(s string) (float64, error)
+	// Returns the string value of the provided duration (diff).
+	DurationString(d float64) string
 }
 
 type comparator[T any] struct {
@@ -57,12 +64,24 @@ func (c *comparator[T]) Greater(a, b T) bool {
 type timeComparator struct {
 }
 
-func (t *timeComparator) Diff(a, b time.Time) float64 {
+func (tc *timeComparator) Diff(a, b time.Time) float64 {
 	return float64(a.Sub(b))
 }
 
-func (t *timeComparator) Add(a time.Time, magnitude float64) time.Time {
+func (tc *timeComparator) Add(a time.Time, magnitude float64) time.Time {
 	return a.Add(time.Duration(magnitude))
+}
+
+func (tc *timeComparator) DurationFromString(s string) (float64, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	return float64(d), nil
+}
+
+func (tc *timeComparator) DurationString(d float64) string {
+	return time.Duration(d).String()
 }
 
 // TimeComparator is a Comparator implementation for time.Time.
@@ -71,12 +90,24 @@ var TimeComparator Comparator[time.Time] = &comparator[time.Time]{&timeComparato
 type durationComparator struct {
 }
 
-func (d *durationComparator) Diff(a, b time.Duration) float64 {
+func (dc *durationComparator) Diff(a, b time.Duration) float64 {
 	return float64(a - b)
 }
 
-func (d *durationComparator) Add(a time.Duration, magnitude float64) time.Duration {
+func (dc *durationComparator) Add(a time.Duration, magnitude float64) time.Duration {
 	return a + time.Duration(magnitude)
+}
+
+func (dc *durationComparator) DurationFromString(s string) (float64, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	return float64(d), nil
+}
+
+func (dc *durationComparator) DurationString(d float64) string {
+	return time.Duration(d).String()
 }
 
 // DurationComparator is a Comparator implementation for time.Duration.
@@ -85,12 +116,24 @@ var DurationComparator Comparator[time.Duration] = &comparator[time.Duration]{&d
 type doubleComparator struct {
 }
 
-func (d *doubleComparator) Diff(a, b float64) float64 {
-	return float64(a - b)
+func (dc *doubleComparator) Diff(a, b float64) float64 {
+	return a - b
 }
 
-func (d *doubleComparator) Add(a float64, magnitude float64) float64 {
+func (dc *doubleComparator) Add(a float64, magnitude float64) float64 {
 	return a + magnitude
+}
+
+func (dc *doubleComparator) DurationFromString(s string) (float64, error) {
+	d, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	return float64(d), nil
+}
+
+func (dc *doubleComparator) DurationString(d float64) string {
+	return strconv.FormatFloat(d, 'f', -1, 64)
 }
 
 // DoubleComparator is a Comparator implementation for float64.

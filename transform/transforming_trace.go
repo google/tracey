@@ -51,7 +51,8 @@ type transformingTrace[T any, CP, SP, DP fmt.Stringer] struct {
 	// Mappings from original to new Spans (or RootSpans).
 	transformingSpansByOriginal     map[trace.Span[T, CP, SP, DP]]spanTransformer[T, CP, SP, DP]
 	transformingRootSpansByOriginal map[trace.RootSpan[T, CP, SP, DP]]spanTransformer[T, CP, SP, DP]
-	// A mapping from original to new Dependencies.
+	// A mapping from original to new Dependencies.  The transforming dependency
+	// may be nil, if its destinations no longer exist.
 	transformingDependenciesByOriginal map[trace.Dependency[T, CP, SP, DP]]dependencyTransformer[T, CP, SP, DP]
 }
 
@@ -72,7 +73,9 @@ func (tt *transformingTrace[T, CP, SP, DP]) appliedTransformations() *appliedTra
 }
 
 func (tt *transformingTrace[T, CP, SP, DP]) newMutableDependency(original trace.Dependency[T, CP, SP, DP]) trace.MutableDependency[T, CP, SP, DP] {
-	return tt.new.NewMutableDependency(original.DependencyType()).WithPayload(original.Payload())
+	dep := tt.new.NewMutableDependency(original.DependencyType(), original.Options())
+	dep.WithPayload(original.Payload())
+	return dep
 }
 
 // Returns the new Span corresponding to the provided original one.
@@ -156,7 +159,7 @@ func (tt *transformingTrace[T, CP, SP, DP]) scheduleUngatedInitialElementarySpan
 	est elementarySpanTransformer[T, CP, SP, DP],
 	at T,
 ) {
-	est.updateStart(at)
+	est.updateNonDependencyStart(at)
 	tt.schedulableElementarySpans = append(tt.schedulableElementarySpans, est)
 	for _, asg := range tt.ats.appliedSpanGates {
 		span := est.originalParent()
@@ -177,7 +180,7 @@ func (tt *transformingTrace[T, CP, SP, DP]) scheduleNewlyUngatedElementarySpans(
 		if gated {
 			newGatedElementarySpans = append(newGatedElementarySpans, ges)
 		} else {
-			ges.est.updateStart(at)
+			ges.est.updateNonDependencyStart(at)
 			tt.schedulableElementarySpans = append(tt.schedulableElementarySpans, ges.est)
 			for _, asg := range tt.ats.appliedSpanGates {
 				span := ges.est.originalParent()
@@ -209,7 +212,7 @@ func (tt *transformingTrace[T, CP, SP, DP]) transformElementarySpans(
 			lastES.WithEnd(thisES.End())
 			if thisES.Outgoing() != nil {
 				thisES.Outgoing().(trace.MutableDependency[T, CP, SP, DP]).
-					WithOriginElementarySpan(lastES)
+					WithOriginElementarySpan(tt.comparator(), lastES)
 			}
 		} else {
 			newESs = append(newESs, thisES)
@@ -413,5 +416,7 @@ func transformTrace[T any, CP, SP, DP fmt.Stringer](
 			return nil, err
 		}
 	}
+	// Simplify the new Trace before returning to clean any empty spans or dependencies.
+	tt.new.Simplify()
 	return tt.new, nil
 }

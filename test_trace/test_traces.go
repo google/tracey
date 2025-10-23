@@ -49,9 +49,7 @@ func (tu *testUnserializer) DefaultNamer() trace.Namer[time.Duration, StringPayl
 var TestUnserializer = &testUnserializer{}
 
 // TPP is a test prettyprinter usable with the Traces defined in this file.
-var TPP = NewPrettyPrinter[time.Duration, StringPayload, StringPayload, StringPayload](
-	HierarchyTypeNames, DependencyTypeNames,
-)
+var TPP = NewPrettyPrinter[time.Duration, StringPayload, StringPayload, StringPayload](TestNamer)
 
 // Paths returns the provided variadic set of strings as a string slice.
 func Paths(strs ...string) []string {
@@ -98,34 +96,36 @@ func Trace1() (
 		WithRootSpans(
 			RootSpan(0, 100, "s0.0.0",
 				ParentCategories(
-					FindCategory(Structural, "p0/t0.0/r0.0.0"),
-					FindCategory(Causal, "p0/t0.0/r0.0.0"),
+					FindCategory(Structural, "p0", "t0.0", "r0.0.0"),
+					FindCategory(Causal, "p0", "t0.0", "r0.0.0"),
 				),
+				Mark("start", 0),
 				Span(10, 90, "0",
 					Span(40, 70, "3"),
 				),
+				Mark("end", 100),
 			),
 			RootSpan(30, 70, "s0.1.0",
 				ParentCategories(
-					FindCategory(Structural, "p0/t0.1/r0.1.0"),
-					FindCategory(Causal, "p0/t0.0/t0.1/r0.1.0"),
+					FindCategory(Structural, "p0", "t0.1", "r0.1.0"),
+					FindCategory(Causal, "p0", "t0.0", "t0.1", "r0.1.0"),
 				),
 			),
 			RootSpan(30, 50, "s1.0.0",
 				ParentCategories(
-					FindCategory(Structural, "p1/t1.0/r1.0.0"),
-					FindCategory(Causal, "p0/p1/t1.0/r1.0.0"),
+					FindCategory(Structural, "p1", "t1.0", "r1.0.0"),
+					FindCategory(Causal, "p0", "p1", "t1.0", "r1.0.0"),
 				),
 			),
 		).
 		WithDependency(
 			Spawn, "",
-			Origin(Paths("s0.0.0/0"), 20),
+			Origin(Paths("s0.0.0", "0"), 20),
 			Destination(Paths("s0.1.0"), 30),
 		).
 		WithDependency(
 			Spawn, "",
-			Origin(Paths("s0.0.0/0"), 30),
+			Origin(Paths("s0.0.0", "0"), 30),
 			Destination(Paths("s1.0.0"), 30),
 		).
 		WithDependency(
@@ -136,7 +136,7 @@ func Trace1() (
 		WithDependency(
 			Signal, "",
 			Origin(Paths("s0.1.0"), 50),
-			DestinationAfterWait(Paths("s0.0.0/0/3"), 50, 60),
+			DestinationAfterWait(Paths("s0.0.0", "0", "3"), 50, 60),
 		).
 		Build()
 	trace.Simplify()

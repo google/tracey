@@ -26,23 +26,21 @@ import (
 	"github.com/google/tracey/trace"
 )
 
-// TracePrettyPrinter facilitates prettyprinting trace data for testing.
+// TracePrettyPrinter facilitates pretty-printing trace data for testing.
 type TracePrettyPrinter[T any, CP, SP, DP fmt.Stringer] struct {
-	hierarchyTypeNames  map[trace.HierarchyType]string
-	dependencyTypeNames map[trace.DependencyType]string
-	pointPrinter        func(T) string
+	namer                        trace.Namer[T, CP, SP, DP]
+	pointPrinter                 func(T) string
+	includeElementarySpanIndices bool
 }
 
 // NewPrettyPrinter returns a new TracePrettyPrinter, rendering hierarchy and
-// dependency type names according to the provided mappings, and rendering
+// dependency type names according to the provided namer, and rendering
 // trace points with %v.
 func NewPrettyPrinter[T any, CP, SP, DP fmt.Stringer](
-	hierarchyTypeNames map[trace.HierarchyType]string,
-	dependencyTypeNames map[trace.DependencyType]string,
+	namer trace.Namer[T, CP, SP, DP],
 ) *TracePrettyPrinter[T, CP, SP, DP] {
 	return &TracePrettyPrinter[T, CP, SP, DP]{
-		hierarchyTypeNames:  hierarchyTypeNames,
-		dependencyTypeNames: dependencyTypeNames,
+		namer: namer,
 	}
 }
 
@@ -50,6 +48,13 @@ func NewPrettyPrinter[T any, CP, SP, DP fmt.Stringer](
 // the provided point-to-string converter function.
 func (tpp *TracePrettyPrinter[T, CP, SP, DP]) WithPointPrinter(pp func(T) string) *TracePrettyPrinter[T, CP, SP, DP] {
 	tpp.pointPrinter = pp
+	return tpp
+}
+
+// WithElementarySpanIndicesIncluded specifies that prettyprinted elementary
+// spans should include their index within their span.
+func (tpp *TracePrettyPrinter[T, CP, SP, DP]) WithElementarySpanIndicesIncluded() *TracePrettyPrinter[T, CP, SP, DP] {
+	tpp.includeElementarySpanIndices = true
 	return tpp
 }
 
@@ -68,9 +73,22 @@ const (
 	sourceAndDest
 )
 
+func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintDependencyEndpoint(
+	endpoint trace.ElementarySpan[T, CP, SP, DP],
+) string {
+	ret := strings.Join(trace.GetSpanDisplayPath(endpoint.Span(), tpp.namer), "/")
+	if tpp.includeElementarySpanIndices {
+		idx := -1
+		for cursor := endpoint; cursor != nil; cursor = cursor.Predecessor() {
+			idx++
+		}
+		ret = fmt.Sprintf("%s (#%d)", ret, idx)
+	}
+	return ret
+}
+
 func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintDependency(
 	dep trace.Dependency[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 	m printDepMode,
 ) string {
 	if dep == nil {
@@ -78,15 +96,24 @@ func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintDependency(
 	}
 	dests := make([]string, len(dep.Destinations()))
 	for idx, dest := range dep.Destinations() {
-		destSpanPath := strings.Join(trace.GetSpanDisplayPath(dest.Span(), namer), "/")
-		dests[idx] = fmt.Sprintf("%s @%s", destSpanPath, tpp.printPoint(dest.Start()))
+		dests[idx] = fmt.Sprintf("%s @%s", tpp.prettyPrintDependencyEndpoint(dest), tpp.printPoint(dest.Start()))
 	}
 	originStr := "<unknown>"
-	if dep.Origin() != nil {
-		originStr = fmt.Sprintf("%s @%s",
-			strings.Join(trace.GetSpanDisplayPath(dep.Origin().Span(), namer), "/"),
-			tpp.printPoint(dep.Origin().End()),
-		)
+	if len(dep.Origins()) > 0 {
+		var originStrs []string
+		for _, origin := range dep.Origins() {
+			originStrs = append(originStrs,
+				fmt.Sprintf("%s @%s", tpp.prettyPrintDependencyEndpoint(origin), tpp.printPoint(origin.End())),
+			)
+		}
+		if len(originStrs) == 1 {
+			originStr = originStrs[0]
+		} else {
+			originStr = fmt.Sprintf("(triggering) %s (also nontriggering %s)",
+				originStrs[0],
+				strings.Join(originStrs[1:], ", "),
+			)
+		}
 	}
 	destStr := "<none>"
 	if len(dests) > 0 {
@@ -95,17 +122,17 @@ func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintDependency(
 	switch m {
 	case sourceOnly:
 		return fmt.Sprintf("[%s from %s]",
-			tpp.dependencyTypeNames[dep.DependencyType()],
+			tpp.namer.DependencyTypes().TypeData(dep.DependencyType()).Name,
 			originStr,
 		)
 	case destOnly:
 		return fmt.Sprintf("[%s to %s]",
-			tpp.dependencyTypeNames[dep.DependencyType()],
+			tpp.namer.DependencyTypes().TypeData(dep.DependencyType()).Name,
 			destStr,
 		)
 	default:
 		return fmt.Sprintf("[%s from %s to %s]",
-			tpp.dependencyTypeNames[dep.DependencyType()],
+			tpp.namer.DependencyTypes().TypeData(dep.DependencyType()).Name,
 			originStr,
 			destStr,
 		)
@@ -114,53 +141,70 @@ func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintDependency(
 
 func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintElementarySpan(
 	es trace.ElementarySpan[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
+	includeMarks bool,
 	indent string,
 ) string {
+	indexStr := ""
+	if tpp.includeElementarySpanIndices {
+		idx := -1
+		for cursor := es; cursor != nil; cursor = cursor.Predecessor() {
+			idx++
+		}
+		indexStr = fmt.Sprintf("(#%d) ", idx)
+	}
 	ret := []string{
-		fmt.Sprintf("%s%s %s -> THIS -> %s",
+		fmt.Sprintf("%s%s%s %s -> THIS -> %s",
 			indent,
+			indexStr,
 			fmt.Sprintf("%s-%s", tpp.printPoint(es.Start()), tpp.printPoint(es.End())),
-			tpp.prettyPrintDependency(es.Incoming(), namer, sourceOnly),
-			tpp.prettyPrintDependency(es.Outgoing(), namer, destOnly),
+			tpp.prettyPrintDependency(es.Incoming(), sourceOnly),
+			tpp.prettyPrintDependency(es.Outgoing(), destOnly),
 		),
+	}
+	if includeMarks {
+		for _, mark := range es.Marks() {
+			ret = append(ret, fmt.Sprintf("%s  '%s' @%v", indent, mark.Label(), tpp.printPoint(mark.Moment())))
+		}
 	}
 	return strings.Join(ret, "\n")
 }
 
+// PrettyPrintElementarySpan prettyprints the provided elementary span.
+func (tpp *TracePrettyPrinter[T, CP, SP, DP]) PrettyPrintElementarySpan(es trace.ElementarySpan[T, CP, SP, DP]) string {
+	return tpp.namer.SpanName(es.Span()) + " " + tpp.prettyPrintElementarySpan(es, false, "")
+}
+
 func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintSpan(
 	span trace.Span[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 	indent string,
 ) string {
-	spanPath := strings.Join(trace.GetSpanDisplayPath(span, namer), "/")
+	spanPath := strings.Join(trace.GetSpanDisplayPath(span, tpp.namer), "/")
 	ret := []string{
-		fmt.Sprintf("%sSpan '%s' (%s-%s) (%s)", indent, namer.SpanName(span), tpp.printPoint(span.Start()), tpp.printPoint(span.End()), spanPath),
+		fmt.Sprintf("%sSpan '%s' (%s-%s) (%s)", indent, tpp.namer.SpanName(span), tpp.printPoint(span.Start()), tpp.printPoint(span.End()), spanPath),
 		fmt.Sprintf("%s  Elementary spans:", indent),
 	}
 	for _, es := range span.ElementarySpans() {
-		ret = append(ret, tpp.prettyPrintElementarySpan(es, namer, indent+"    "))
+		ret = append(ret, tpp.prettyPrintElementarySpan(es, true, indent+"    "))
 	}
 	for _, child := range span.ChildSpans() {
-		ret = append(ret, tpp.prettyPrintSpan(child, namer, indent+"  "))
+		ret = append(ret, tpp.prettyPrintSpan(child, indent+"  "))
 	}
 	return strings.Join(ret, "\n")
 }
 
 func (tpp *TracePrettyPrinter[T, CP, SP, DP]) prettyPrintCategory(
 	cat trace.Category[T, CP, SP, DP],
-	namer trace.Namer[T, CP, SP, DP],
 	ht trace.HierarchyType, indent string,
 ) string {
-	catPath := strings.Join(trace.GetCategoryDisplayPath(cat, namer), "/")
+	catPath := strings.Join(trace.GetCategoryDisplayPath(cat, tpp.namer), "/")
 	ret := []string{
-		fmt.Sprintf("%sCategory '%s' (%s)", indent, namer.CategoryName(cat), catPath),
+		fmt.Sprintf("%sCategory '%s' (%s)", indent, tpp.namer.CategoryName(cat), catPath),
 	}
 	for _, span := range cat.RootSpans() {
-		ret = append(ret, tpp.prettyPrintSpan(span, namer, indent+"  "))
+		ret = append(ret, tpp.prettyPrintSpan(span, indent+"  "))
 	}
 	for _, cat := range cat.ChildCategories() {
-		ret = append(ret, tpp.prettyPrintCategory(cat, namer, ht, indent+"  "))
+		ret = append(ret, tpp.prettyPrintCategory(cat, ht, indent+"  "))
 	}
 	return strings.Join(ret, "\n")
 }
@@ -171,12 +215,23 @@ func (tpp *TracePrettyPrinter[T, CP, SP, DP]) PrettyPrintTrace(
 	t trace.Trace[T, CP, SP, DP],
 	ht trace.HierarchyType,
 ) string {
+	td := tpp.namer.HierarchyTypes().TypeData(ht)
+	hts := fmt.Sprintf("hierarchy type %v", ht)
+	if td != nil {
+		hts = td.Description
+	}
 	ret := []string{
 		"",
-		fmt.Sprintf("Trace (%s):", tpp.hierarchyTypeNames[ht]),
+		fmt.Sprintf("Trace (%s):", hts),
 	}
-	for _, cat := range t.RootCategories(ht) {
-		ret = append(ret, tpp.prettyPrintCategory(cat, t.DefaultNamer(), ht, "  "))
+	if ht == trace.SpanOnlyHierarchyType {
+		for _, span := range t.RootSpans() {
+			ret = append(ret, tpp.prettyPrintSpan(span, "  "))
+		}
+	} else {
+		for _, cat := range t.RootCategories(ht) {
+			ret = append(ret, tpp.prettyPrintCategory(cat, ht, "  "))
+		}
 	}
 	return strings.Join(ret, "\n")
 }
@@ -196,7 +251,7 @@ func (tpp *TracePrettyPrinter[T, CP, SP, DP]) PrettyPrintTraceSpans(
 		return namer.SpanName(rootSpans[a]) < namer.SpanName(rootSpans[b])
 	})
 	for _, rootSpan := range rootSpans {
-		ret = append(ret, tpp.prettyPrintSpan(rootSpan, namer, "  "))
+		ret = append(ret, tpp.prettyPrintSpan(rootSpan, "  "))
 	}
 	return strings.Join(ret, "\n")
 }

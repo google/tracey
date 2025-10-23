@@ -30,38 +30,32 @@ func TestSpanSelectionFullExpansion(t *testing.T) {
 	trace := testTrace1(t)
 	for _, test := range []struct {
 		description          string
-		matchers             [][]PathElementMatcher[time.Duration, payload, payload, payload]
+		matchers             []PathElementMatcher
 		wantMatchingSpansStr string // Lexically sorted for stability.
 	}{{
 		description: "find span by literal path",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchLiteralName("b"),
-				matchLiteralName("c"),
-			),
+		matchers: pathMatcher(
+			NewLiteralNameMatcher("a"),
+			NewLiteralNameMatcher("b"),
+			NewLiteralNameMatcher("c"),
 		),
 		wantMatchingSpansStr: `
 c: 20ns-30ns`,
 	}, {
 		description: "find **/c",
-		matchers: matchers(
-			pathMatcher(
-				matchGlobstar,
-				matchLiteralName("c"),
-			),
+		matchers: pathMatcher(
+			Globstar,
+			NewLiteralNameMatcher("c"),
 		),
 		wantMatchingSpansStr: `
 c: 20ns-30ns
 c: 50ns-90ns`,
 	}, {
 		description: "find a/c/**",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchLiteralName("c"),
-				matchGlobstar,
-			),
+		matchers: pathMatcher(
+			NewLiteralNameMatcher("a"),
+			NewLiteralNameMatcher("c"),
+			Globstar,
 		),
 		wantMatchingSpansStr: `
 c: 50ns-90ns
@@ -69,12 +63,10 @@ d: 60ns-80ns
 e: 65ns-75ns`,
 	}, {
 		description: "find a/*/*",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchStar,
-				matchStar,
-			),
+		matchers: pathMatcher(
+			NewLiteralNameMatcher("a"),
+			Star,
+			Star,
 		),
 		wantMatchingSpansStr: `
 c: 20ns-30ns
@@ -82,11 +74,59 @@ d: 60ns-80ns`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
 			selection := SelectSpans(
-				trace,
-				NewSpanFinder(&testNamer{}).WithSpanMatchers(test.matchers...),
+				NewSpanFinder(
+					NewSpanPattern(SpanMatchers(test.matchers)),
+					trace,
+				),
 			)
 			matchingSpans := selection.Spans()
-			gotMatchingSpansStrs := []string{}
+			var gotMatchingSpansStrs []string
+			for _, span := range matchingSpans {
+				gotMatchingSpansStrs = append(
+					gotMatchingSpansStrs,
+					fmt.Sprintf("%s: %v-%v", span.Payload(), span.Start(), span.End()),
+				)
+			}
+			sort.Strings(gotMatchingSpansStrs)
+			gotMatchingSpansStr := "\n" + strings.Join(gotMatchingSpansStrs, "\n")
+			if diff := cmp.Diff(test.wantMatchingSpansStr, gotMatchingSpansStr); diff != "" {
+				t.Errorf("Got trace spans\n%s\ndiff (-want +got) %s", gotMatchingSpansStr, diff)
+			}
+		})
+	}
+}
+
+func TestMultiplePaths(t *testing.T) {
+	trace := testTrace1(t)
+	for _, test := range []struct {
+		description          string
+		matchers             [][]PathElementMatcher
+		wantMatchingSpansStr string // Lexically sorted for stability.
+	}{{
+		description: "a/b/c, a/c/d",
+		matchers: [][]PathElementMatcher{
+			pathMatcher(
+				NewLiteralNameMatcher("a"),
+				NewLiteralNameMatcher("b"),
+				NewLiteralNameMatcher("c"),
+			),
+			pathMatcher(
+				NewLiteralNameMatcher("a"),
+				NewLiteralNameMatcher("c"),
+				NewLiteralNameMatcher("d"),
+			),
+		},
+		wantMatchingSpansStr: `
+c: 20ns-30ns
+d: 60ns-80ns`,
+	}} {
+		t.Run(test.description, func(t *testing.T) {
+			sp := NewSpanPattern(SpanMatchers(test.matchers...))
+			selection := SelectSpans(
+				NewSpanFinder(sp, trace),
+			)
+			matchingSpans := selection.Spans()
+			var gotMatchingSpansStrs []string
 			for _, span := range matchingSpans {
 				gotMatchingSpansStrs = append(
 					gotMatchingSpansStrs,
@@ -107,20 +147,24 @@ func TestSpanSelectionIncludes(t *testing.T) {
 	span := trace.NewRootSpan(0, 100, "parent")
 	child, err := span.NewChildSpan(DurationComparator, 30, 60, "child")
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 	grandchild, err := child.NewChildSpan(DurationComparator, 40, 50, "grandchild")
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 	ss := SelectSpans(
-		trace,
-		NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			pathMatcher(
-				matchLiteralName("parent"),
-				matchStar,
-				matchStar,
+		NewSpanFinder(
+			NewSpanPattern(
+				SpanMatchers(
+					pathMatcher(
+						NewLiteralNameMatcher("parent"),
+						Star,
+						Star,
+					),
+				),
 			),
+			trace,
 		),
 	)
 	if !ss.Includes(grandchild) {
@@ -131,7 +175,7 @@ func TestSpanSelectionIncludes(t *testing.T) {
 func testTrace2(t *testing.T) Trace[time.Duration, payload, payload, payload] {
 	t.Helper()
 	trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
-	a := trace.NewRootCategory(0, "a")
+	a := trace.NewRootCategory(1, "a")
 	ab := a.NewChildCategory("b")
 	ab.NewChildCategory("c")
 	ac := a.NewChildCategory("c")
@@ -144,52 +188,69 @@ func TestCategorySelectionFullExpansion(t *testing.T) {
 	trace := testTrace2(t)
 	for _, test := range []struct {
 		description               string
-		matchers                  [][]PathElementMatcher[time.Duration, payload, payload, payload]
+		pattern                   *SpanPattern
 		wantMatchingCategoriesStr string // Lexically sorted for stability.
 	}{{
 		description: "find category by literal path",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchLiteralName("b"),
-				matchLiteralName("c"),
+		pattern: NewSpanPattern(
+			SpanAndCategoryMatchers(
+				1,
+				[]PathElementMatcher{
+					NewLiteralNameMatcher("a"),
+					NewLiteralNameMatcher("b"),
+					NewLiteralNameMatcher("c"),
+				},
+				nil,
 			),
 		),
 		wantMatchingCategoriesStr: `c`,
 	}, {
 		description: "find **/c",
-		matchers: matchers(
-			pathMatcher(
-				matchGlobstar,
-				matchLiteralName("c"),
+		pattern: NewSpanPattern(
+			SpanAndCategoryMatchers(
+				1,
+				[]PathElementMatcher{
+					Globstar,
+					NewLiteralNameMatcher("c"),
+				},
+				nil,
 			),
 		),
 		wantMatchingCategoriesStr: `c,c`,
 	}, {
 		description: "find a/c/**",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchLiteralName("c"),
-				matchGlobstar,
+		pattern: NewSpanPattern(
+			SpanAndCategoryMatchers(
+				1,
+				[]PathElementMatcher{
+					NewLiteralNameMatcher("a"),
+					NewLiteralNameMatcher("c"),
+					Globstar,
+				},
+				nil,
 			),
 		),
 		wantMatchingCategoriesStr: `c,d,e`,
 	}, {
 		description: "find a/*/*",
-		matchers: matchers(
-			pathMatcher(
-				matchLiteralName("a"),
-				matchStar,
-				matchStar,
+		pattern: NewSpanPattern(
+			SpanAndCategoryMatchers(
+				1,
+				[]PathElementMatcher{
+					NewLiteralNameMatcher("a"),
+					Star,
+					Star,
+				},
+				nil,
 			),
 		),
 		wantMatchingCategoriesStr: `c,d`,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
-			selection := SelectCategories(trace, &testNamer{}, 0, test.matchers)
+			sf := NewSpanFinder(test.pattern, trace)
+			selection := SelectCategories(sf)
 			matchingCategories := selection.Categories(0)
-			gotMatchingCategoriesStrs := []string{}
+			var gotMatchingCategoriesStrs []string
 			for _, category := range matchingCategories {
 				gotMatchingCategoriesStrs = append(
 					gotMatchingCategoriesStrs,
@@ -207,18 +268,23 @@ func TestCategorySelectionFullExpansion(t *testing.T) {
 
 func TestCategorySelectionIncludes(t *testing.T) {
 	trace := NewTrace[time.Duration, payload, payload, payload](DurationComparator, &testNamer{})
-	span := trace.NewRootCategory(0, "parent")
+	span := trace.NewRootCategory(1, "parent")
 	child := span.NewChildCategory("child")
 	grandchild := child.NewChildCategory("grandchild")
 	ss := SelectCategories(
-		trace,
-		&testNamer{},
-		0,
-		matchers(pathMatcher(
-			matchLiteralName("parent"),
-			matchStar,
-			matchStar,
-		),
+		NewSpanFinder(
+			NewSpanPattern(
+				SpanAndCategoryMatchers(
+					1,
+					[]PathElementMatcher{
+						NewLiteralNameMatcher("parent"),
+						Star,
+						Star,
+					},
+					nil,
+				),
+			),
+			trace,
 		),
 	)
 	if !ss.Includes(grandchild) {
@@ -231,28 +297,34 @@ func TestDependencySelection(t *testing.T) {
 	span := trace.NewRootSpan(0, 100, "parent")
 	child, err := span.NewChildSpan(DurationComparator, 30, 60, "child")
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 	grandchild, err := child.NewChildSpan(DurationComparator, 40, 50, "grandchild")
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 	if err := trace.NewDependency(3, "").
 		SetOriginSpan(trace.Comparator(), grandchild, 45); err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 	if err := trace.NewDependency(3, "").
 		AddDestinationSpan(trace.Comparator(), span, 60); err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 	}
 
 	sd := SelectDependencies(
 		trace,
-		NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(literalNameMatchers("parent", "child", "grandchild"))...,
+		NewSpanFinder(
+			NewSpanPattern(
+				SpanMatchers(literalNameMatchers("parent", "child", "grandchild")),
+			),
+			trace,
 		),
-		NewSpanFinder(&testNamer{}).WithSpanMatchers(
-			matchers(literalNameMatchers("parent"))...,
+		NewSpanFinder(
+			NewSpanPattern(
+				SpanMatchers(literalNameMatchers("parent")),
+			),
+			trace,
 		),
 		3,
 	)

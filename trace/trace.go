@@ -195,9 +195,8 @@ func (c *category[T, CP, SP, DP]) UpdatePayload(payload CP) {
 	c.payload = payload
 }
 
-// A type containing, and supporting common operations on, a slice of
-// elementary spans.
-type elementarySpanSequence[T any, CP, SP, DP fmt.Stringer] struct {
+// A common base type for rootSpan and nonRootSpan.
+type commonSpan[T any, CP, SP, DP fmt.Stringer] struct {
 	// This span's ElementarySpans, in increasing temporal order.  This type
 	// maintains several invariants on this slice and its ElementarySpans:
 	// *  Each ElementarySpan begins at or after the end of its predecessor;
@@ -213,29 +212,34 @@ type elementarySpanSequence[T any, CP, SP, DP fmt.Stringer] struct {
 	// *  Gaps between adjacent ElementarySpans represent intervals of suspended
 	//    execution.
 	elementarySpans []ElementarySpan[T, CP, SP, DP]
+	start, end      T
+	payload         SP
+	childSpans      []Span[T, CP, SP, DP]
 }
 
 // Simplifies the receiver by merging abutting elementary spans and suspend
 // intervals where no dependencies intervene.
-func (ess *elementarySpanSequence[T, CP, SP, DP]) simplify(comparator Comparator[T]) {
+func (cs *commonSpan[T, CP, SP, DP]) simplifyElementarySpans(comparator Comparator[T]) {
 	var lastES *elementarySpan[T, CP, SP, DP]
-	newESs := make([]ElementarySpan[T, CP, SP, DP], 0, len(ess.elementarySpans))
-	for idx := 0; idx < len(ess.elementarySpans); idx++ {
-		thisES := ess.elementarySpanAt(idx)
+	newESs := make([]ElementarySpan[T, CP, SP, DP], 0, len(cs.elementarySpans))
+	for idx := 0; idx < len(cs.elementarySpans); idx++ {
+		thisES := cs.elementarySpanAt(idx)
 		// Remove instantaneous interior elementary spans having no dependencies.
-		if idx > 0 && idx < len(ess.elementarySpans)-1 &&
+		if idx > 0 && idx < len(cs.elementarySpans)-1 &&
 			comparator.Equal(thisES.Start(), thisES.End()) &&
 			thisES.incoming == nil && thisES.outgoing == nil {
-			ess.elementarySpans = slices.Delete(ess.elementarySpans, idx, idx)
+			cs.elementarySpans = slices.Delete(cs.elementarySpans, idx, idx)
 			continue
 		}
 		// Merge abutting elementary spans with no intervening dependencies.
 		if lastES != nil &&
 			comparator.Equal(lastES.End(), thisES.Start()) &&
 			lastES.outgoing == nil && thisES.incoming == nil {
-			lastES.outgoing = thisES.outgoing
+			if thisES.outgoing != nil {
+				thisES.outgoing.replaceOriginElementarySpan(thisES, lastES)
+			}
 			lastES.end = thisES.end
-			ess.elementarySpans = slices.Delete(ess.elementarySpans, idx, idx)
+			cs.elementarySpans = slices.Delete(cs.elementarySpans, idx, idx)
 			continue
 		}
 		if lastES != nil {
@@ -248,7 +252,7 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) simplify(comparator Comparator
 	if lastES != nil {
 		newESs = append(newESs, lastES)
 	}
-	ess.elementarySpans = newESs
+	cs.elementarySpans = newESs
 }
 
 // Returns the index in the receiver's slice of elementary spans of the
@@ -258,26 +262,26 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) simplify(comparator Comparator
 // first elementary span, returns (0, false); if it lies after the last
 // elementary span, returns (n, false), where n is the number of elementary
 // spans.
-func (ess *elementarySpanSequence[T, CP, SP, DP]) findFirstElementarySpanIndexEndingAtOrAfter(
+func (cs *commonSpan[T, CP, SP, DP]) findFirstElementarySpanIndexEndingAtOrAfter(
 	comparator Comparator[T],
 	at T,
 ) (idx int, contains bool) {
-	if len(ess.elementarySpans) == 0 ||
-		comparator.Less(at, ess.elementarySpans[0].Start()) {
+	if len(cs.elementarySpans) == 0 ||
+		comparator.Less(at, cs.elementarySpans[0].Start()) {
 		// The requested point lies before the first span, or there are no
 		// elementary spans.
 		return 0, false
 	}
 	// Find the position of the first elementary span whose endpoint is not less
 	// than the requested point.
-	ret := sort.Search(len(ess.elementarySpans), func(x int) bool {
-		return comparator.LessOrEqual(at, ess.elementarySpanAt(x).End())
+	ret := sort.Search(len(cs.elementarySpans), func(x int) bool {
+		return comparator.LessOrEqual(at, cs.elementarySpanAt(x).End())
 	})
-	if ret == len(ess.elementarySpans) {
+	if ret == len(cs.elementarySpans) {
 		// The requested point lies after the span.
 		return ret, false
 	}
-	if comparator.Greater(ess.elementarySpanAt(ret).Start(), at) {
+	if comparator.Greater(cs.elementarySpanAt(ret).Start(), at) {
 		// The only elementary span that could contain the requested point does
 		// not.  That is, the requested point lies in a gap between elementary
 		// spans.
@@ -286,48 +290,158 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) findFirstElementarySpanIndexEn
 	return ret, true
 }
 
-func assembleSuspendOptions(options ...SuspendOption) SuspendOption {
-	ret := DefaultSuspendOptions
-	for _, option := range options {
-		ret = ret | option
+// Returns the index in the receiver's slice of elementary spans of the
+// last elementary span ending at or after the specified point, and a boolean
+// indicating whether the elementary span at that index contains the specified
+// point (inclusively at both ends).  If the specified point lies before the
+// first elementary span, returns (0, false); if it lies after the last
+// elementary span, returns (n, false), where n is the number of elementary
+// spans.
+func (cs *commonSpan[T, CP, SP, DP]) findLastElementarySpanIndexEndingAtOrAfter(
+	comparator Comparator[T],
+	at T,
+) (idx int, contains bool) {
+	// Find the position of the first elementary span whose endpoint is greater
+	// than the requested point.
+	ret := sort.Search(len(cs.elementarySpans), func(x int) bool {
+		return comparator.Less(at, cs.elementarySpanAt(x).End())
+	})
+	if ret < len(cs.elementarySpans) &&
+		comparator.GreaterOrEqual(at, cs.elementarySpanAt(ret).Start()) {
+		// The requested point lies within the elementary span at ret.
+		return ret, true
 	}
-	return ret
+	if ret == 0 {
+		// The point lies before the first elementary span.
+		return ret, false
+	}
+	// The requested point either lies in the elementary span before ret, or
+	// between that span and the one at ret.
+	prev := ret - 1
+	if comparator.Greater(at, cs.elementarySpanAt(prev).End()) {
+		// The requested point lies before the elementary span at ret, but after
+		// the one before ret.
+		return ret, false
+	}
+	// The elementary span at prev is the last ending at or after the requested
+	// point.
+	return prev, true
 }
 
-func (ess *elementarySpanSequence[T, CP, SP, DP]) suspendWithinOneElementarySpan(
+func assembleOptions[T ~uint64](def T, options ...T) T {
+	for _, option := range options {
+		def = def | option
+	}
+	return def
+}
+
+func (cs *commonSpan[T, CP, SP, DP]) suspendWithinOneElementarySpan(
 	comparator Comparator[T],
 	start, end T,
+	opts SuspendOption,
 ) error {
 	// If the specified suspend is zero-width, there's nothing to do.
 	if comparator.Equal(start, end) {
 		return nil
 	}
-	suspendSpanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, end)
-	if !found {
+	suspendSpanIdx, contains := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, end)
+	if !contains {
 		return fmt.Errorf("no elementary span at %v", end)
 	}
-	suspendSpan := ess.elementarySpanAt(suspendSpanIdx)
-
+	suspendSpan := cs.elementarySpanAt(suspendSpanIdx)
 	if !suspendSpan.contains(comparator, start) {
 		return fmt.Errorf("requested suspend crosses elementary span boundaries")
 	}
-	preSuspendSpanIdx, postSuspendSpanIdx, ok := ess.fissionElementarySpanAt(comparator, end)
+	preSuspendSpanIdx, postSuspendSpanIdx, ok, err := cs.fissionElementarySpanAt(comparator, end, fissionEarliest)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return fmt.Errorf("failed to fission an elementary span that should have existed")
 	}
-	preSuspendSpan := ess.elementarySpanAt(preSuspendSpanIdx)
+	preSuspendSpan := cs.elementarySpanAt(preSuspendSpanIdx)
+	postSuspendSpan := cs.elementarySpanAt(postSuspendSpanIdx)
 	preSuspendSpan.end = start
-	postSuspendSpan := ess.elementarySpanAt(postSuspendSpanIdx)
+	preSuspendOrphanedMarkStartIndex := sort.Search(len(preSuspendSpan.marks), func(idx int) bool {
+		return comparator.Greater(preSuspendSpan.marks[idx].Moment(), start)
+	})
+	if preSuspendOrphanedMarkStartIndex < len(preSuspendSpan.marks) {
+		if opts&SuspendFissionsAroundMarks == 0 {
+			return fmt.Errorf("failed to suspend: at least one mark lies within suspend interval")
+		}
+		for markIdx := preSuspendOrphanedMarkStartIndex; markIdx < len(preSuspendSpan.marks); markIdx++ {
+			mark := preSuspendSpan.marks[markIdx]
+			markedSpanIdx, err := cs.createInstantaneousElementarySpanWithinSuspendAt(comparator, mark.Moment())
+			if err != nil {
+				return err
+			}
+			markedSpan := cs.elementarySpanAt(markedSpanIdx)
+			markedSpan.marks = []MutableMark[T]{mark}
+		}
+		preSuspendSpan.marks = preSuspendSpan.marks[:preSuspendOrphanedMarkStartIndex]
+	}
 	postSuspendSpan.start = end
+	postSuspendOrphanedMarkEndIndex := sort.Search(len(postSuspendSpan.marks), func(idx int) bool {
+		return comparator.GreaterOrEqual(end, postSuspendSpan.marks[idx].Moment())
+	})
+	if postSuspendOrphanedMarkEndIndex < len(postSuspendSpan.marks) {
+		if opts&SuspendFissionsAroundMarks == 0 {
+			return fmt.Errorf("failed to suspend: at least one mark lies within suspend interval")
+		}
+		for markIdx := 0; markIdx <= postSuspendOrphanedMarkEndIndex; markIdx++ {
+			mark := postSuspendSpan.marks[markIdx]
+			markedSpanIdx, err := cs.createInstantaneousElementarySpanWithinSuspendAt(comparator, mark.Moment())
+			if err != nil {
+				return err
+			}
+			markedSpan := cs.elementarySpanAt(markedSpanIdx)
+			markedSpan.marks = []MutableMark[T]{mark}
+		}
+		postSuspendSpan.marks = postSuspendSpan.marks[postSuspendOrphanedMarkEndIndex:]
+	}
 	return nil
 }
 
-func (ess *elementarySpanSequence[T, CP, SP, DP]) Suspend(
+func (cs *commonSpan[T, CP, SP, DP]) Mark(
+	comparator Comparator[T],
+	label string,
+	moment T,
+	options ...MarkOption,
+) error {
+	opts := assembleOptions(DefaultMarkOptions, options...)
+	markedSpanIdx, _ := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, moment)
+	if markedSpanIdx == len(cs.elementarySpans) {
+		return fmt.Errorf("cannot add mark at %v: moment lies after the span", moment)
+	}
+	markedSpan := cs.elementarySpanAt(markedSpanIdx)
+	if !markedSpan.contains(comparator, moment) {
+		if opts&MarkCanFissionSuspend == 0 {
+			return fmt.Errorf("cannot add mark at %v: no elementary span at moment", moment)
+		}
+		var err error
+		markedSpanIdx, err = cs.createInstantaneousElementarySpanWithinSuspendAt(comparator, moment)
+		if err != nil {
+			return err
+		}
+		markedSpan = cs.elementarySpanAt(markedSpanIdx)
+	}
+	insertPoint := sort.Search(len(markedSpan.marks), func(idx int) bool {
+		return comparator.Diff(moment, markedSpan.marks[idx].Moment()) <= 0
+	})
+	var m MutableMark[T] = &mark[T]{
+		label:  label,
+		moment: moment,
+	}
+	markedSpan.marks = slices.Insert(markedSpan.marks, insertPoint, m)
+	return nil
+}
+
+func (cs *commonSpan[T, CP, SP, DP]) Suspend(
 	comparator Comparator[T],
 	start, end T,
 	options ...SuspendOption,
 ) error {
-	opts := assembleSuspendOptions(options...)
+	opts := assembleOptions(DefaultSuspendOptions, options...)
 	if opts&SuspendFissionsAroundElementarySpanEndpoints == SuspendFissionsAroundElementarySpanEndpoints {
 		// Suspends were requested to fission around elementary span endpoints.
 		// Work `end` backwards from the original endpoint until it is earlier than
@@ -338,20 +452,20 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) Suspend(
 		//     had the predecessor P, set `end` to P.End()
 		//   * Otherwise, there's no more to be done.
 		for comparator.Greater(end, start) {
-			endSpanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, end)
-			if !found {
+			endSpanIdx, contains := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, end)
+			if !contains {
 				return fmt.Errorf("no elementary span at %v", end)
 			}
-			endSpan := ess.elementarySpanAt(endSpanIdx)
+			endSpan := cs.elementarySpanAt(endSpanIdx)
 			chunkStart := endSpan.Start()
 			if comparator.Greater(start, chunkStart) {
 				chunkStart = start
 			}
-			if err := ess.suspendWithinOneElementarySpan(comparator, chunkStart, end); err != nil {
+			if err := cs.suspendWithinOneElementarySpan(comparator, chunkStart, end, opts); err != nil {
 				return err
 			}
 			if endSpanIdx > 0 {
-				previousSpan := ess.elementarySpanAt(endSpanIdx - 1)
+				previousSpan := cs.elementarySpanAt(endSpanIdx - 1)
 				end = previousSpan.End()
 			} else {
 				break
@@ -361,18 +475,25 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) Suspend(
 	}
 	// Suspends should not fission around elementary span endpoints.  Expect to
 	// suspend within a single elementary span, and fail if that isn't possible.
-	return ess.suspendWithinOneElementarySpan(comparator, start, end)
+	return cs.suspendWithinOneElementarySpan(comparator, start, end, opts)
 }
 
 // Returns the *elementarySpan in the receiver at the specified index.  The
 // caller is responsible for ensuring that this is a valid index.
-func (ess *elementarySpanSequence[T, CP, SP, DP]) elementarySpanAt(idx int) *elementarySpan[T, CP, SP, DP] {
-	return ess.elementarySpans[idx].(*elementarySpan[T, CP, SP, DP])
+func (cs *commonSpan[T, CP, SP, DP]) elementarySpanAt(idx int) *elementarySpan[T, CP, SP, DP] {
+	return cs.elementarySpans[idx].(*elementarySpan[T, CP, SP, DP])
 }
+
+type fissionPolicy int
+
+const (
+	fissionEarliest fissionPolicy = iota
+	fissionLatest
+)
 
 // Fissions the receiver's elementary span at the specified point, returning
 // the indexes of the elementary spans before and after that point after the
-// fission, and true on success.  If there is no elementary span at the
+// fission, and true on succcs.  If there is no elementary span at the
 // specified point, returns false.
 // Fissioning an elementary span at one of its ends will result in a zero-width
 // elementary span (at beforeIdx when fissioning at the start, and afterIdx
@@ -380,21 +501,38 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) elementarySpanAt(idx int) *ele
 // lie 'within' several spans: suppose elementary spans A, B, and C, of which A
 // and B are zero-width and both start (and end) at T1, whereas C starts at T1
 // and ends at T2; T1 then lies 'within' spans A, B, and C.  In such case, the
-// first span whose endpoint is not less than the requested span will be
-// fissioned: for the above example, A will be fissioned.
-func (ess *elementarySpanSequence[T, CP, SP, DP]) fissionElementarySpanAt(
+// specified fission policy determines whether the first or the last span
+// containing the requested point is the one fissioned.
+// If fissioning is successful, any incoming dependency the original elementary
+// span had will lead into the elementary span at beforeIdx, and any outgoing
+// dependency the original elementary span had will lead from the elementary
+// span at afterIdx.
+func (cs *commonSpan[T, CP, SP, DP]) fissionElementarySpanAt(
 	comparator Comparator[T],
 	at T,
-) (beforeIdx, afterIdx int, fissioned bool) {
-	esIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
-	if !found {
-		return 0, 0, false
+	policy fissionPolicy,
+) (beforeIdx, afterIdx int, fissioned bool, err error) {
+	var esIdx int
+	var contains bool
+	switch policy {
+	case fissionEarliest:
+		esIdx, contains = cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
+	case fissionLatest:
+		esIdx, contains = cs.findLastElementarySpanIndexEndingAtOrAfter(comparator, at)
+	default:
+		return 0, 0, false, fmt.Errorf("unknown fission policy %d", policy)
+	}
+	if !contains {
+		return 0, 0, false, nil
 	}
 	// The span to fission.
-	originalES := ess.elementarySpanAt(esIdx)
+	originalES := cs.elementarySpanAt(esIdx)
 	// Fission the original span by moving its end point forward to the fission
 	// point, and creating a new span from the fission point to the original
 	// span's endpoint.
+	markSplitIndex := sort.Search(len(originalES.marks), func(idx int) bool {
+		return comparator.GreaterOrEqual(originalES.marks[idx].Moment(), at)
+	})
 	newES := &elementarySpan[T, CP, SP, DP]{
 		span:        originalES.Span(),
 		start:       at,
@@ -402,36 +540,40 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) fissionElementarySpanAt(
 		predecessor: originalES,
 		successor:   originalES.successor,
 		outgoing:    nil,
+		marks:       originalES.marks[markSplitIndex:],
 	}
+	originalES.marks = originalES.marks[:markSplitIndex]
 	originalES.successor = newES
 	if newES.successor != nil {
 		newES.successor.(*elementarySpan[T, CP, SP, DP]).predecessor = newES
 	}
 	originalES.end = at
 	if originalES.outgoing != nil {
-		// If the original span had an outgoing dependency, this is moved to the
-		// new span (and the dependency's origin updated.)
-		originalES.outgoing, newES.outgoing = nil, originalES.outgoing
-		newES.outgoing.WithOriginElementarySpan(newES)
+		originalES.outgoing.replaceOriginElementarySpan(originalES, newES)
 	}
-	// Insert the new span into this ess.
-	ess.elementarySpans = slices.Insert(ess.elementarySpans, esIdx+1, ElementarySpan[T, CP, SP, DP](newES))
-	return esIdx, esIdx + 1, true
+	// Insert the new span into this cs.
+	cs.elementarySpans = slices.Insert(cs.elementarySpans, esIdx+1, ElementarySpan[T, CP, SP, DP](newES))
+	return esIdx, esIdx + 1, true, nil
 }
 
-func (ess *elementarySpanSequence[T, CP, SP, DP]) createInstantaneousElementarySpanAt(
+func (cs *commonSpan[T, CP, SP, DP]) createInstantaneousElementarySpanWithinSuspendAt(
 	comparator Comparator[T],
 	at T,
 ) (idx int, err error) {
-	spanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
-	if found {
+	spanIdx, contains := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
+	if contains {
 		return 0, fmt.Errorf("can't create instantaneous elementary span: another elementary span would overlap it")
 	}
-	if spanIdx == 0 || spanIdx == len(ess.elementarySpans) {
-		return 0, fmt.Errorf("can't create instantaneous elementary span: it would lie outside its span")
+	if spanIdx == 0 || spanIdx == len(cs.elementarySpans) {
+		return 0, fmt.Errorf("can't create instantaneous elementary span at %v: it would lie outside its span (%v-%v)",
+			at, cs.Start(), cs.End(),
+		)
 	}
-	prevES := ess.elementarySpanAt(spanIdx - 1)
-	nextES := ess.elementarySpanAt(spanIdx)
+	nextES := cs.elementarySpanAt(spanIdx)
+	if comparator.Less(nextES.Start(), at) {
+		return 0, fmt.Errorf("can't create instantaneous elementary span at %v: span is not suspended then", at)
+	}
+	prevES := cs.elementarySpanAt(spanIdx - 1)
 	newES := &elementarySpan[T, CP, SP, DP]{
 		span:        nextES.Span(),
 		start:       at,
@@ -440,54 +582,66 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) createInstantaneousElementaryS
 		successor:   nextES,
 	}
 	nextES.predecessor = newES
-	prevES.successor = newES
-	ess.elementarySpans = slices.Insert(ess.elementarySpans, spanIdx, ElementarySpan[T, CP, SP, DP](newES))
+	if prevES != nil {
+		prevES.successor = newES
+	}
+	cs.elementarySpans = slices.Insert(cs.elementarySpans, spanIdx, ElementarySpan[T, CP, SP, DP](newES))
 	return spanIdx, nil
 }
 
-func assembleDependencyOptions(options ...DependencyOption) DependencyOption {
-	ret := DefaultDependencyOptions
-	for _, option := range options {
-		ret = ret | option
+func checkDependencyEndpointOptions(opts DependencyEndpointOption) error {
+	if opts&(PlaceDependencyEndpointAsEarlyAsPossible|PlaceDependencyEndpointAsLateAsPossible) ==
+		(PlaceDependencyEndpointAsEarlyAsPossible | PlaceDependencyEndpointAsLateAsPossible) {
+		return fmt.Errorf("invalid options: cannot place a dependency edge both as early and as late as possible")
 	}
-	return ret
+	return nil
 }
 
 // Adds the provided outgoing dependency in the receiver at the specified
 // point.  If an existing elementary span ends at the specified time and has
 // no outgoing dependences, the provided dependency will be added to that one,
 // otherwise a new elementary span will be created (which may be zero-width.)
-func (ess *elementarySpanSequence[T, CP, SP, DP]) addOutgoingDependency(
+// By default, outgoing dependencies are placed in the last elementary span at
+// the specified point.
+func (cs *commonSpan[T, CP, SP, DP]) addOutgoingDependency(
 	comparator Comparator[T],
 	dep *dependency[T, CP, SP, DP],
 	at T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	opts := assembleDependencyOptions(options...)
-	if dep.Origin() != nil {
-		return fmt.Errorf("multiple dependency origins")
+	opts := assembleOptions(DefaultDependencyEndpointOptions, options...)
+	if err := checkDependencyEndpointOptions(opts); err != nil {
+		return nil
 	}
-	spanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
-	if !found {
-		if opts&DependencyCanFissionSuspend != DependencyCanFissionSuspend {
+	spanIdx, contains := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
+	if !contains {
+		if opts&DependencyEndpointCanFissionSuspend != DependencyEndpointCanFissionSuspend {
 			return fmt.Errorf("no elementary span at %v to which to add an outgoing dependency", at)
 		}
 		var err error
-		spanIdx, err = ess.createInstantaneousElementarySpanAt(comparator, at)
+		spanIdx, err = cs.createInstantaneousElementarySpanWithinSuspendAt(comparator, at)
 		if err != nil {
 			return err
 		}
 	}
-	es := ess.elementarySpanAt(spanIdx)
+	es := cs.elementarySpanAt(spanIdx)
 	if !comparator.Equal(es.End(), at) || es.Outgoing() != nil {
-		spanIdx, _, ok := ess.fissionElementarySpanAt(comparator, at)
+		fissionPolicy := fissionLatest
+		if opts&PlaceDependencyEndpointAsEarlyAsPossible == PlaceDependencyEndpointAsEarlyAsPossible {
+			fissionPolicy = fissionEarliest
+		}
+		spanIdx, _, ok, err := cs.fissionElementarySpanAt(comparator, at, fissionPolicy)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return fmt.Errorf("failed to fission an elementary span that should have existed")
 		}
-		es = ess.elementarySpans[spanIdx].(*elementarySpan[T, CP, SP, DP])
+		es = cs.elementarySpans[spanIdx].(*elementarySpan[T, CP, SP, DP])
 	}
-	es.outgoing = dep
-	dep.setOrigin(es)
+	if dep.setOrigin(comparator, es) {
+		return fmt.Errorf("adding an outgoing dependency invalidated a previous origin for that dependency")
+	}
 	return nil
 }
 
@@ -495,31 +649,43 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) addOutgoingDependency(
 // point.  If an existing elementary span starts at the specified time and has
 // no incoming dependences, the provided dependency will be added to that one,
 // otherwise a new elementary span will be created (which may be zero-width.)
-func (ess *elementarySpanSequence[T, CP, SP, DP]) addIncomingDependency(
+// By default, incoming dependencies are placed in the first elementary span at
+// the specified point.
+func (cs *commonSpan[T, CP, SP, DP]) addIncomingDependency(
 	comparator Comparator[T],
 	dep *dependency[T, CP, SP, DP],
 	at T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	opts := assembleDependencyOptions(options...)
-	spanIdx, found := ess.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
-	if !found {
-		if opts&DependencyCanFissionSuspend != DependencyCanFissionSuspend {
+	opts := assembleOptions(DefaultDependencyEndpointOptions, options...)
+	if err := checkDependencyEndpointOptions(opts); err != nil {
+		return nil
+	}
+	spanIdx, contains := cs.findFirstElementarySpanIndexEndingAtOrAfter(comparator, at)
+	if !contains {
+		if opts&DependencyEndpointCanFissionSuspend != DependencyEndpointCanFissionSuspend {
 			return fmt.Errorf("no elementary span at %v to which to add an incoming dependency", at)
 		}
 		var err error
-		spanIdx, err = ess.createInstantaneousElementarySpanAt(comparator, at)
+		spanIdx, err = cs.createInstantaneousElementarySpanWithinSuspendAt(comparator, at)
 		if err != nil {
 			return err
 		}
 	}
-	span := ess.elementarySpanAt(spanIdx)
+	span := cs.elementarySpanAt(spanIdx)
 	if !comparator.Equal(span.Start(), at) || span.Incoming() != nil {
-		_, spanIdx, ok := ess.fissionElementarySpanAt(comparator, at)
+		fissionPolicy := fissionEarliest
+		if opts&PlaceDependencyEndpointAsLateAsPossible == PlaceDependencyEndpointAsLateAsPossible {
+			fissionPolicy = fissionLatest
+		}
+		_, spanIdx, ok, err := cs.fissionElementarySpanAt(comparator, at, fissionPolicy)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return fmt.Errorf("failed to fission an elementary span that should have existed")
 		}
-		span = ess.elementarySpanAt(spanIdx)
+		span = cs.elementarySpanAt(spanIdx)
 	}
 	span.incoming = dep
 	dep.destinations = append(dep.destinations, span)
@@ -528,28 +694,20 @@ func (ess *elementarySpanSequence[T, CP, SP, DP]) addIncomingDependency(
 
 // Adds the provided incoming dependency in the receiver at the specified
 // dependency point, preceding it with a wait from the specified wait point.
-func (ess *elementarySpanSequence[T, CP, SP, DP]) addIncomingDependencyWithWait(
+func (cs *commonSpan[T, CP, SP, DP]) addIncomingDependencyWithWait(
 	comparator Comparator[T],
 	dep *dependency[T, CP, SP, DP],
 	waitFrom, dependencyAt T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	if err := ess.Suspend(comparator, waitFrom, dependencyAt); err != nil {
+	if err := cs.Suspend(comparator, waitFrom, dependencyAt); err != nil {
 		return err
 	}
-	return ess.addIncomingDependency(comparator, dep, dependencyAt, options...)
-}
-
-// A common base type for rootSpan and nonRootSpan.
-type commonSpan[T any, CP, SP, DP fmt.Stringer] struct {
-	elementarySpanSequence[T, CP, SP, DP]
-	start, end T
-	payload    SP
-	childSpans []Span[T, CP, SP, DP]
+	return cs.addIncomingDependency(comparator, dep, dependencyAt, options...)
 }
 
 func (cs *commonSpan[T, CP, SP, DP]) simplify(comparator Comparator[T]) {
-	cs.elementarySpanSequence.simplify(comparator)
+	cs.simplifyElementarySpans(comparator)
 	for _, child := range cs.childSpans {
 		child.simplify(comparator)
 	}
@@ -557,10 +715,9 @@ func (cs *commonSpan[T, CP, SP, DP]) simplify(comparator Comparator[T]) {
 
 func newCommonSpan[T any, CP, SP, DP fmt.Stringer](start, end T, payload SP) *commonSpan[T, CP, SP, DP] {
 	return &commonSpan[T, CP, SP, DP]{
-		elementarySpanSequence: elementarySpanSequence[T, CP, SP, DP]{},
-		start:                  start,
-		end:                    end,
-		payload:                payload,
+		start:   start,
+		end:     end,
+		payload: payload,
 	}
 }
 
@@ -569,16 +726,20 @@ func newMutableCommonSpan[T any, CP, SP, DP fmt.Stringer](elementarySpans []Muta
 		return nil, fmt.Errorf("at least one elementary span must be provided to newMutableCommonSpan")
 	}
 	ess := make([]ElementarySpan[T, CP, SP, DP], len(elementarySpans))
+	var lastES *elementarySpan[T, CP, SP, DP]
 	for idx, es := range elementarySpans {
+		thisES := es.(*elementarySpan[T, CP, SP, DP])
+		if lastES != nil {
+			lastES.successor, thisES.predecessor = thisES, lastES
+		}
+		lastES = thisES
 		ess[idx] = es
 	}
 	return &commonSpan[T, CP, SP, DP]{
-		elementarySpanSequence: elementarySpanSequence[T, CP, SP, DP]{
-			elementarySpans: ess,
-		},
-		start:   elementarySpans[0].Start(),
-		end:     elementarySpans[len(elementarySpans)-1].End(),
-		payload: payload,
+		elementarySpans: ess,
+		start:           elementarySpans[0].Start(),
+		end:             elementarySpans[len(elementarySpans)-1].End(),
+		payload:         payload,
 	}, nil
 }
 
@@ -622,6 +783,7 @@ func (cs *commonSpan[T, CP, SP, DP]) newChildSpan(
 	child.elementarySpans = append(child.elementarySpans, makeInitialElementarySpan[T, CP, SP, DP](child))
 	call := &dependency[T, CP, SP, DP]{
 		dependencyType: Call,
+		options:        DefaultDependencyOptions,
 	}
 	if err := parent.addOutgoingDependency(comparator, call, start); err != nil {
 		return nil, err
@@ -631,11 +793,17 @@ func (cs *commonSpan[T, CP, SP, DP]) newChildSpan(
 	}
 	ret := &dependency[T, CP, SP, DP]{
 		dependencyType: Return,
+		options:        DefaultDependencyOptions,
 	}
 	if err := child.addOutgoingDependency(comparator, ret, end); err != nil {
 		return nil, err
 	}
-	if err := parent.addIncomingDependencyWithWait(comparator, ret, start, end); err != nil {
+	// Generally, if multiple dependencies impinge upon a span at the same
+	// moment, all incoming dependencies should be resolved before all outgoing
+	// dependencies.  However, in this case, we know that the incoming return
+	// dependency in the parent is causally dependent on the outgoing call in the
+	// parent, and so we force that incoming return to be placed last.
+	if err := parent.addIncomingDependencyWithWait(comparator, ret, start, end, PlaceDependencyEndpointAsLateAsPossible); err != nil {
 		return nil, err
 	}
 	return child, nil
@@ -649,6 +817,10 @@ type nonRootSpan[T any, CP, SP, DP fmt.Stringer] struct {
 
 func (nrs *nonRootSpan[T, CP, SP, DP]) ParentSpan() Span[T, CP, SP, DP] {
 	return nrs.parent
+}
+
+func (nrs *nonRootSpan[T, CP, SP, DP]) RootSpan() RootSpan[T, CP, SP, DP] {
+	return nrs.parent.RootSpan()
 }
 
 func (nrs *nonRootSpan[T, CP, SP, DP]) NewChildSpan(
@@ -688,6 +860,10 @@ type rootSpan[T any, CP, SP, DP fmt.Stringer] struct {
 
 func (rs *rootSpan[T, CP, SP, DP]) ParentSpan() Span[T, CP, SP, DP] {
 	return nil
+}
+
+func (rs *rootSpan[T, CP, SP, DP]) RootSpan() RootSpan[T, CP, SP, DP] {
+	return rs
 }
 
 func (rs *rootSpan[T, CP, SP, DP]) ParentCategory(ht HierarchyType) Category[T, CP, SP, DP] {
@@ -740,27 +916,40 @@ func (rs *rootSpan[T, CP, SP, DP]) setParentSpan(child MutableSpan[T, CP, SP, DP
 type dependency[T any, CP, SP, DP fmt.Stringer] struct {
 	dependencyType DependencyType
 	payload        DP
-	origin         ElementarySpan[T, CP, SP, DP]   // Non-nil for a complete dependency.
+	options        DependencyOption
+	origins        []ElementarySpan[T, CP, SP, DP] // Non-empty for a complete dependency.
 	destinations   []ElementarySpan[T, CP, SP, DP] // Non-empty for a complete dependency.
 }
 
 func (t *trace[T, CP, SP, DP]) NewDependency(
 	dependencyType DependencyType,
 	payload DP,
+	dependencyOptions ...DependencyOption,
 ) Dependency[T, CP, SP, DP] {
+	options := DefaultDependencyOptions
+	for _, do := range dependencyOptions {
+		options |= do
+	}
 	t.observedDependencyType(dependencyType)
 	return &dependency[T, CP, SP, DP]{
 		dependencyType: dependencyType,
 		payload:        payload,
+		options:        options,
 	}
 }
 
 func (t *trace[T, CP, SP, DP]) NewMutableDependency(
 	dependencyType DependencyType,
+	dependencyOptions ...DependencyOption,
 ) MutableDependency[T, CP, SP, DP] {
+	options := DefaultDependencyOptions
+	for _, do := range dependencyOptions {
+		options |= do
+	}
 	t.observedDependencyType(dependencyType)
 	return &dependency[T, CP, SP, DP]{
 		dependencyType: dependencyType,
+		options:        options,
 	}
 }
 
@@ -774,8 +963,19 @@ func (d *dependency[T, CP, SP, DP]) DependencyType() DependencyType {
 	return d.dependencyType
 }
 
-func (d *dependency[T, CP, SP, DP]) Origin() ElementarySpan[T, CP, SP, DP] {
-	return d.origin
+func (d *dependency[T, CP, SP, DP]) TriggeringOrigin() ElementarySpan[T, CP, SP, DP] {
+	if len(d.origins) == 0 {
+		return nil
+	}
+	return d.origins[0]
+}
+
+func (d *dependency[T, CP, SP, DP]) Origins() []ElementarySpan[T, CP, SP, DP] {
+	return d.origins
+}
+
+func (d *dependency[T, CP, SP, DP]) Options() DependencyOption {
+	return d.options
 }
 
 func (d *dependency[T, CP, SP, DP]) Destinations() []ElementarySpan[T, CP, SP, DP] {
@@ -800,39 +1000,52 @@ func commonSpanFrom[T any, CP, SP, DP fmt.Stringer](spanIf Span[T, CP, SP, DP]) 
 func (d *dependency[T, CP, SP, DP]) SetOriginSpan(
 	comparator Comparator[T],
 	from Span[T, CP, SP, DP], start T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	return commonSpanFrom(from).
-		addOutgoingDependency(comparator, d, start, options...)
+	if err := commonSpanFrom(from).
+		addOutgoingDependency(comparator, d, start, options...); err != nil {
+		return fmt.Errorf("failed to set dependency origin span at %v: %w",
+			start, err)
+	}
+	return nil
 }
 
 func (d *dependency[T, CP, SP, DP]) AddDestinationSpan(
 	comparator Comparator[T],
 	to Span[T, CP, SP, DP], end T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	return commonSpanFrom(to).
-		addIncomingDependency(comparator, d, end, options...)
+	if err := commonSpanFrom(to).
+		addIncomingDependency(comparator, d, end, options...); err != nil {
+		return fmt.Errorf("failed to add dependency destination span at %v: %w",
+			end, err)
+	}
+	return nil
 }
 
 func (d *dependency[T, CP, SP, DP]) AddDestinationSpanAfterWait(
 	comparator Comparator[T],
 	to Span[T, CP, SP, DP],
 	waitFrom, end T,
-	options ...DependencyOption,
+	options ...DependencyEndpointOption,
 ) error {
-	return commonSpanFrom(to).
+	if err := commonSpanFrom(to).
 		addIncomingDependencyWithWait(
 			comparator,
 			d,
 			waitFrom,
 			end,
 			options...,
-		)
+		); err != nil {
+		return fmt.Errorf("failed to set dependency destination span at %v, waiting from %v: %w",
+			end, waitFrom, err)
+	}
+	return nil
 }
 
-func (d *dependency[T, CP, SP, DP]) WithOriginElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP] {
-	d.setOrigin(es.withOutgoing(d))
+func (d *dependency[T, CP, SP, DP]) WithOriginElementarySpan(comparator Comparator[T], es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP] {
+	// Ignore the return value; WithOriginElementarySpan explicitly has replace semantics.
+	d.setOrigin(comparator, es)
 	return d
 }
 
@@ -841,26 +1054,110 @@ func (d *dependency[T, CP, SP, DP]) WithPayload(payload DP) MutableDependency[T,
 	return d
 }
 
-func (d *dependency[T, CP, SP, DP]) SetOriginElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) error {
-	if d.origin != nil {
-		return fmt.Errorf("a dependency may only have one origin")
+func (d *dependency[T, CP, SP, DP]) SetOriginElementarySpan(
+	comparator Comparator[T],
+	es MutableElementarySpan[T, CP, SP, DP],
+) error {
+	if d.options.Includes(MultipleOriginsWithAndSemantics) && d.options.Includes(MultipleOriginsWithOrSemantics) {
+		return fmt.Errorf("cannot set dependency origin: dependency has both AND and OR semantics")
 	}
-	d.WithOriginElementarySpan(es)
+	if len(d.origins) > 0 && !d.options.Includes(multipleOrigins) {
+		return fmt.Errorf("cannot set dependency origin: it already has an origin, and it does not support multiple origins")
+	}
+	if d.setOrigin(comparator, es) {
+		return fmt.Errorf("adding an outgoing dependency invalidated a previous origin for that dependency")
+	}
 	return nil
 }
 
 func (d *dependency[T, CP, SP, DP]) WithDestinationElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP] {
-	d.destinations = append(d.destinations, es.withIncoming(d))
+	es.(*elementarySpan[T, CP, SP, DP]).incoming = d
+	d.destinations = append(d.destinations, es)
 	return d
 }
 
-func (d *dependency[T, CP, SP, DP]) setOrigin(es ElementarySpan[T, CP, SP, DP]) {
-	d.origin = es
+func (d *dependency[T, CP, SP, DP]) replaceOriginElementarySpan(original, new MutableElementarySpan[T, CP, SP, DP]) {
+	for idx, origin := range d.origins {
+		if origin == original {
+			d.origins[idx] = new
+			original.(*elementarySpan[T, CP, SP, DP]).outgoing = nil
+			new.(*elementarySpan[T, CP, SP, DP]).outgoing = d
+			break
+		}
+	}
+}
+
+// setOrigin sets the provided ElementarySpan as an origin of the receiver,
+// returning a boolean indicating whether any preexisting origins were removed,
+// and their connection to the receiver deleted, as a result of this operation.
+//
+// If the receiver can support multiple origins, then the provided origin is
+// added to the receiver's set of origins, updating its TriggeringOrigin if
+// it is earlier (OR semantics) or later (AND semantics) than the existing
+// TriggeringOrigin.  In this case, this method always returns false.
+//
+// If the receiver cannot support multiple origins, then the provided origin
+// replaces the previous origin, if there is one.  If this occurs, the
+// previous origin's Outgoing dependency is nulled out, and this method returns
+// true.
+func (d *dependency[T, CP, SP, DP]) setOrigin(
+	comparator Comparator[T],
+	es ElementarySpan[T, CP, SP, DP],
+) (existingOriginRemoved bool) {
+	es.(*elementarySpan[T, CP, SP, DP]).outgoing = d
+	if d.options.Includes(MultipleOriginsWithAndSemantics) {
+		if len(d.origins) > 0 && comparator.Greater(es.End(), d.origins[0].End()) {
+			es, d.origins[0] = d.origins[0], es
+		}
+		d.origins = append(d.origins, es)
+	} else if d.options.Includes(MultipleOriginsWithOrSemantics) {
+		if len(d.origins) > 0 && comparator.Less(es.End(), d.origins[0].End()) {
+			es, d.origins[0] = d.origins[0], es
+		}
+		d.origins = append(d.origins, es)
+	} else {
+		if len(d.origins) > 0 {
+			d.origins[0].(*elementarySpan[T, CP, SP, DP]).outgoing = nil
+			existingOriginRemoved = true
+		}
+		d.origins = []ElementarySpan[T, CP, SP, DP]{es}
+	}
+	return existingOriginRemoved
+}
+
+// Implements MutableMark[T]
+type mark[T any] struct {
+	label  string
+	moment T
+}
+
+// NewMutableMark returns a new, empty MutableMark.
+func NewMutableMark[T any]() MutableMark[T] {
+	return &mark[T]{}
+}
+
+func (m *mark[T]) Label() string {
+	return m.label
+}
+
+func (m *mark[T]) Moment() T {
+	return m.moment
+}
+
+func (m *mark[T]) WithLabel(label string) MutableMark[T] {
+	m.label = label
+	return m
+}
+
+func (m *mark[T]) WithMoment(moment T) MutableMark[T] {
+	m.moment = moment
+	return m
 }
 
 // Implements MutableElementarySpan[T, CP, SP, DP]
 type elementarySpan[T any, CP, SP, DP fmt.Stringer] struct {
 	span                   Span[T, CP, SP, DP]
+	marks                  []MutableMark[T]
 	start, end             T
 	predecessor, successor ElementarySpan[T, CP, SP, DP]
 	// The dependency, if any, at the start of this elementary span.
@@ -884,6 +1181,14 @@ func (es *elementarySpan[T, CP, SP, DP]) endsAfter(comparator Comparator[T], at 
 
 func (es *elementarySpan[T, CP, SP, DP]) Span() Span[T, CP, SP, DP] {
 	return es.span
+}
+
+func (es *elementarySpan[T, CP, SP, DP]) Marks() []Mark[T] {
+	ret := make([]Mark[T], len(es.marks))
+	for idx, m := range es.marks {
+		ret[idx] = m
+	}
+	return ret
 }
 
 func (es *elementarySpan[T, CP, SP, DP]) Start() T {
@@ -921,13 +1226,8 @@ func (es *elementarySpan[T, CP, SP, DP]) withParentSpan(span MutableSpan[T, CP, 
 	return es
 }
 
-func (es *elementarySpan[T, CP, SP, DP]) withIncoming(incoming MutableDependency[T, CP, SP, DP]) MutableElementarySpan[T, CP, SP, DP] {
-	es.incoming = incoming
-	return es
-}
-
-func (es *elementarySpan[T, CP, SP, DP]) withOutgoing(outgoing MutableDependency[T, CP, SP, DP]) MutableElementarySpan[T, CP, SP, DP] {
-	es.outgoing = outgoing
+func (es *elementarySpan[T, CP, SP, DP]) WithMarks(marks []MutableMark[T]) MutableElementarySpan[T, CP, SP, DP] {
+	es.marks = marks
 	return es
 }
 
@@ -951,14 +1251,6 @@ func makeInitialElementarySpan[T any, CP, SP, DP fmt.Stringer](s Span[T, CP, SP,
 }
 
 // NewMutableElementarySpan creates and returns a new MutableElementarySpan.
-func NewMutableElementarySpan[T any, CP, SP, DP fmt.Stringer](
-	predecessor ElementarySpan[T, CP, SP, DP],
-) MutableElementarySpan[T, CP, SP, DP] {
-	ret := &elementarySpan[T, CP, SP, DP]{
-		predecessor: predecessor,
-	}
-	if predecessor != nil {
-		predecessor.(*elementarySpan[T, CP, SP, DP]).successor = ret
-	}
-	return ret
+func NewMutableElementarySpan[T any, CP, SP, DP fmt.Stringer]() MutableElementarySpan[T, CP, SP, DP] {
+	return &elementarySpan[T, CP, SP, DP]{}
 }

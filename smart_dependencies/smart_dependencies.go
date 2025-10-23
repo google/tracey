@@ -81,19 +81,19 @@ const (
 )
 
 type endpoint[T any, CP, SP, DP fmt.Stringer] struct {
-	span              trace.Span[T, CP, SP, DP]
-	waitFrom, at      T
-	hasWait           bool
-	dependencyOptions []trace.DependencyOption
+	span                      trace.Span[T, CP, SP, DP]
+	waitFrom, at              T
+	hasWait                   bool
+	dependencyEndpointOptions []trace.DependencyEndpointOption
 }
 
 // SmartDependency defines a smart dependency helper.
 type SmartDependency[T any, CP, SP, DP fmt.Stringer] interface {
-	WithOrigin(from trace.Span[T, CP, SP, DP], start T, options ...trace.DependencyOption) SmartDependency[T, CP, SP, DP]
-	WithDestination(to trace.Span[T, CP, SP, DP], end T, options ...trace.DependencyOption) SmartDependency[T, CP, SP, DP]
-	WithDestinationAfterWait(to trace.Span[T, CP, SP, DP], waitFrom, end T, options ...trace.DependencyOption) SmartDependency[T, CP, SP, DP]
+	WithOrigin(from trace.Span[T, CP, SP, DP], start T, options ...trace.DependencyEndpointOption) SmartDependency[T, CP, SP, DP]
+	WithDestination(to trace.Span[T, CP, SP, DP], end T, options ...trace.DependencyEndpointOption) SmartDependency[T, CP, SP, DP]
+	WithDestinationAfterWait(to trace.Span[T, CP, SP, DP], waitFrom, end T, options ...trace.DependencyEndpointOption) SmartDependency[T, CP, SP, DP]
 
-	close(t trace.Trace[T, CP, SP, DP], metrics *Metrics) error
+	close(t trace.Trace[T, CP, SP, DP], metrics *Metrics[T, CP, SP, DP]) error
 	getOptions() Option
 }
 
@@ -105,6 +105,7 @@ type smartDependency[ID comparable, T any, CP, SP, DP fmt.Stringer] struct {
 	options        Option
 	origins        []*endpoint[T, CP, SP, DP]
 	destinations   []*endpoint[T, CP, SP, DP]
+	depOpts        []trace.DependencyOption
 }
 
 // Returns a new SmartDependency of the specified type and with the specified
@@ -114,6 +115,7 @@ func newWithID[ID comparable, T any, CP, SP, DP fmt.Stringer](
 	payload DP,
 	id ID,
 	options Option,
+	depOpts ...trace.DependencyOption,
 ) *smartDependency[ID, T, CP, SP, DP] {
 	return &smartDependency[ID, T, CP, SP, DP]{
 		dependencyType: dependencyType,
@@ -121,6 +123,7 @@ func newWithID[ID comparable, T any, CP, SP, DP fmt.Stringer](
 		hasID:          true,
 		id:             id,
 		options:        options,
+		depOpts:        depOpts,
 	}
 }
 
@@ -129,11 +132,13 @@ func new[ID comparable, T any, CP, SP, DP fmt.Stringer](
 	dependencyType trace.DependencyType,
 	payload DP,
 	options Option,
+	depOpts ...trace.DependencyOption,
 ) *smartDependency[ID, T, CP, SP, DP] {
 	return &smartDependency[ID, T, CP, SP, DP]{
 		dependencyType: dependencyType,
 		payload:        payload,
 		options:        options,
+		depOpts:        depOpts,
 	}
 }
 
@@ -142,12 +147,12 @@ func new[ID comparable, T any, CP, SP, DP fmt.Stringer](
 func (sd *smartDependency[ID, T, CP, SP, DP]) WithOrigin(
 	from trace.Span[T, CP, SP, DP],
 	start T,
-	options ...trace.DependencyOption,
+	options ...trace.DependencyEndpointOption,
 ) SmartDependency[T, CP, SP, DP] {
 	sd.origins = append(sd.origins, &endpoint[T, CP, SP, DP]{
-		span:              from,
-		at:                start,
-		dependencyOptions: options,
+		span:                      from,
+		at:                        start,
+		dependencyEndpointOptions: options,
 	})
 	return sd
 }
@@ -157,12 +162,12 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) WithOrigin(
 func (sd *smartDependency[ID, T, CP, SP, DP]) WithDestination(
 	to trace.Span[T, CP, SP, DP],
 	end T,
-	options ...trace.DependencyOption,
+	options ...trace.DependencyEndpointOption,
 ) SmartDependency[T, CP, SP, DP] {
 	sd.destinations = append(sd.destinations, &endpoint[T, CP, SP, DP]{
-		span:              to,
-		at:                end,
-		dependencyOptions: options,
+		span:                      to,
+		at:                        end,
+		dependencyEndpointOptions: options,
 	})
 	return sd
 }
@@ -174,14 +179,14 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) WithDestinationAfterWait(
 	to trace.Span[T, CP, SP, DP],
 	waitFrom,
 	end T,
-	options ...trace.DependencyOption,
+	options ...trace.DependencyEndpointOption,
 ) SmartDependency[T, CP, SP, DP] {
 	sd.destinations = append(sd.destinations, &endpoint[T, CP, SP, DP]{
-		span:              to,
-		waitFrom:          waitFrom,
-		at:                end,
-		hasWait:           true,
-		dependencyOptions: options,
+		span:                      to,
+		waitFrom:                  waitFrom,
+		at:                        end,
+		hasWait:                   true,
+		dependencyEndpointOptions: options,
 	})
 	return sd
 }
@@ -191,7 +196,8 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) WithDestinationAfterWait(
 // dropped dependencies (those for which instantiated SmartDependencies did not
 // result in trace created Dependencies) can signify causal flaws in the trace,
 // and may hinder causal analyses.
-type Metrics struct {
+type Metrics[T any, CP, SP, DP fmt.Stringer] struct {
+	namer trace.Namer[T, CP, SP, DP]
 	// The count of added origins that could not be added to a dependency,
 	// broken down by dependency type.
 	UnpairedOriginsByType map[trace.DependencyType]uint
@@ -212,47 +218,49 @@ type Metrics struct {
 // PrettyPrintMetrics prettyprints the provided SmartDependencies closure
 // metrics, using the provided trace namer and indent prefix.
 func PrettyPrintMetrics[T any, CP, SP, DP fmt.Stringer](
-	m *Metrics,
-	namer trace.Namer[T, CP, SP, DP],
+	m *Metrics[T, CP, SP, DP],
 	indent string,
 ) string {
 	ret := []string{}
-	dependencyTypes := namer.DependencyTypeNames()
+	dts := m.namer.DependencyTypes()
 	if len(m.UnpairedOriginsByType) > 0 {
 		ret = append(ret, indent+"Unpaired origins by type:")
 		for dt, count := range m.UnpairedOriginsByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dts.TypeData(dt).Name, count))
 		}
 	}
 	if len(m.UnpairedDestinationsByType) > 0 {
 		ret = append(ret, indent+"Unpaired destinations by type:")
 		for dt, count := range m.UnpairedDestinationsByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dts.TypeData(dt).Name, count))
 		}
 	}
 	if len(m.PairedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Paired dependencies by type:")
 		for dt, count := range m.PairedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dts.TypeData(dt).Name, count))
 		}
 	}
 	if len(m.CreatedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Created dependencies by type:")
 		for dt, count := range m.CreatedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dts.TypeData(dt).Name, count))
 		}
 	}
 	if len(m.DroppedDependenciesByType) > 0 {
 		ret = append(ret, indent+"Dropped dependencies by type:")
 		for dt, count := range m.DroppedDependenciesByType {
-			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dependencyTypes[dt], count))
+			ret = append(ret, fmt.Sprintf("%s  %-20s: %d", indent, dts.TypeData(dt).Name, count))
 		}
 	}
 	return strings.Join(ret, "\n")
 }
 
-func newMetrics() *Metrics {
-	return &Metrics{
+func newMetrics[T any, CP, SP, DP fmt.Stringer](
+	namer trace.Namer[T, CP, SP, DP],
+) *Metrics[T, CP, SP, DP] {
+	return &Metrics[T, CP, SP, DP]{
+		namer:                      namer,
 		UnpairedOriginsByType:      map[trace.DependencyType]uint{},
 		UnpairedDestinationsByType: map[trace.DependencyType]uint{},
 		PairedDependenciesByType:   map[trace.DependencyType]uint{},
@@ -261,49 +269,58 @@ func newMetrics() *Metrics {
 	}
 }
 
-func (m *Metrics) withUnpairedOrigins(dt trace.DependencyType, count uint) *Metrics {
+func (m *Metrics[T, CP, SP, DP]) withUnpairedOrigins(dt trace.DependencyType, count uint) *Metrics[T, CP, SP, DP] {
 	if m != nil {
 		m.UnpairedOriginsByType[dt] += count
 	}
 	return m
 }
 
-func (m *Metrics) withUnpairedDestinations(dt trace.DependencyType, count uint) *Metrics {
+func (m *Metrics[T, CP, SP, DP]) withUnpairedDestinations(dt trace.DependencyType, count uint) *Metrics[T, CP, SP, DP] {
 	if m != nil {
 		m.UnpairedDestinationsByType[dt] += count
 	}
 	return m
 }
 
-func (m *Metrics) withPairedDependencies(dt trace.DependencyType, count uint) *Metrics {
+func (m *Metrics[T, CP, SP, DP]) withPairedDependencies(dt trace.DependencyType, count uint) *Metrics[T, CP, SP, DP] {
 	if m != nil {
 		m.PairedDependenciesByType[dt] += count
 	}
 	return m
 }
 
-func (m *Metrics) withCreatedDependencies(dt trace.DependencyType, count uint) *Metrics {
+func (m *Metrics[T, CP, SP, DP]) withCreatedDependencies(dt trace.DependencyType, count uint) *Metrics[T, CP, SP, DP] {
 	if m != nil {
 		m.CreatedDependenciesByType[dt] += count
 	}
 	return m
 }
 
-func (m *Metrics) withDroppedDependencies(dt trace.DependencyType, count uint) *Metrics {
+func (m *Metrics[T, CP, SP, DP]) withDroppedDependencies(dt trace.DependencyType, count uint) *Metrics[T, CP, SP, DP] {
 	if m != nil {
 		m.DroppedDependenciesByType[dt] += count
 	}
 	return m
 }
 
-func (sd *smartDependency[ID, T, CP, SP, DP]) wrapError(err error) error {
+func (sd *smartDependency[ID, T, CP, SP, DP]) wrapError(
+	namer trace.Namer[T, CP, SP, DP],
+	err error,
+) error {
 	if err == nil {
 		return nil
 	}
 	if sd.hasID {
-		return fmt.Errorf("can't close dependency of type %v with id %v: %s", sd.dependencyType, sd.id, err)
+		return fmt.Errorf("can't close dependency of type %s with id %v: %s",
+			namer.DependencyTypes().TypeData(sd.dependencyType).Name,
+			sd.id, err,
+		)
 	}
-	return fmt.Errorf("can't close dependency of type %v: %s", sd.dependencyType, err)
+	return fmt.Errorf("can't close dependency of type %s: %s",
+		namer.DependencyTypes().TypeData(sd.dependencyType).Name,
+		err,
+	)
 }
 
 func (sd *smartDependency[ID, T, CP, SP, DP]) getOptions() Option {
@@ -311,13 +328,13 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) getOptions() Option {
 }
 
 // close completes the Dependency.
-func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP], metrics *Metrics) error {
+func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP], metrics *Metrics[T, CP, SP, DP]) error {
 	var lastOrigin *endpoint[T, CP, SP, DP]
 	var lastDestinations []*endpoint[T, CP, SP, DP]
 	update := func() error {
 		if (lastOrigin != nil || sd.options.includes(KeepDependenciesWithoutOrigins)) &&
 			(len(lastDestinations) > 0 || sd.options.includes(KeepDependenciesWithoutDestinations)) {
-			dep := t.NewDependency(sd.dependencyType, sd.payload)
+			dep := t.NewDependency(sd.dependencyType, sd.payload, sd.depOpts...)
 			metrics.withCreatedDependencies(sd.dependencyType, 1)
 			if lastOrigin != nil && len(lastDestinations) > 0 {
 				metrics.withPairedDependencies(sd.dependencyType, 1)
@@ -327,7 +344,7 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 					t.Comparator(),
 					lastOrigin.span,
 					lastOrigin.at,
-					lastOrigin.dependencyOptions...,
+					lastOrigin.dependencyEndpointOptions...,
 				); err != nil {
 					return err
 				}
@@ -339,7 +356,7 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 						lastDestination.span,
 						lastDestination.waitFrom,
 						lastDestination.at,
-						lastDestination.dependencyOptions...,
+						lastDestination.dependencyEndpointOptions...,
 					); err != nil {
 						return err
 					}
@@ -348,7 +365,7 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 						t.Comparator(),
 						lastDestination.span,
 						lastDestination.at,
-						lastDestination.dependencyOptions...,
+						lastDestination.dependencyEndpointOptions...,
 					); err != nil {
 						return err
 					}
@@ -381,7 +398,7 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 				if t.Comparator().Less(sd.origins[0].at, sd.destinations[0].at) {
 					// Pop and process an origin.
 					if err := update(); err != nil {
-						return sd.wrapError(err)
+						return sd.wrapError(t.DefaultNamer(), err)
 					}
 					lastOrigin, sd.origins = sd.origins[0], sd.origins[1:]
 				} else {
@@ -390,7 +407,7 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 				}
 			case len(sd.origins) > 0:
 				if err := update(); err != nil {
-					return sd.wrapError(err)
+					return sd.wrapError(t.DefaultNamer(), err)
 				}
 				lastOrigin, sd.origins = sd.origins[0], sd.origins[1:]
 			default:
@@ -400,14 +417,14 @@ func (sd *smartDependency[ID, T, CP, SP, DP]) close(t trace.Trace[T, CP, SP, DP]
 		}
 	} else {
 		if len(sd.origins) > 1 {
-			return sd.wrapError(fmt.Errorf("multiple origins specified but reuse is not allowed"))
+			return sd.wrapError(t.DefaultNamer(), fmt.Errorf("multiple origins specified but reuse is not allowed"))
 		}
 		if len(sd.origins) > 0 {
 			lastOrigin, sd.origins = sd.origins[0], nil
 		}
 		lastDestinations, sd.destinations = sd.destinations, nil
 	}
-	return sd.wrapError(update())
+	return sd.wrapError(t.DefaultNamer(), update())
 }
 
 // SmartDependencies manages a collection of SmartDependency instances,
@@ -420,7 +437,9 @@ type SmartDependencies[ID comparable, T any, CP, SP, DP fmt.Stringer] struct {
 }
 
 // New returns a new, empty SmartDependencies set.
-func New[ID comparable, T any, CP, SP, DP fmt.Stringer](t trace.Trace[T, CP, SP, DP]) *SmartDependencies[ID, T, CP, SP, DP] {
+func New[ID comparable, T any, CP, SP, DP fmt.Stringer](
+	t trace.Trace[T, CP, SP, DP],
+) *SmartDependencies[ID, T, CP, SP, DP] {
 	return &SmartDependencies[ID, T, CP, SP, DP]{
 		t:                      t,
 		indexedDepsByTypeAndID: map[trace.DependencyType]map[ID]SmartDependency[T, CP, SP, DP]{},
@@ -489,12 +508,12 @@ func (sd *SmartDependencies[ID, T, CP, SP, DP]) Close() error {
 // CloseWithMetrics closes all contained SmartDependencies and clears the
 // receiver, returning metrics about dependency creation success.  Upon an
 // error, fails fast and returns that error and nil metrics.
-func (sd *SmartDependencies[ID, T, CP, SP, DP]) CloseWithMetrics() (*Metrics, error) {
+func (sd *SmartDependencies[ID, T, CP, SP, DP]) CloseWithMetrics() (*Metrics[T, CP, SP, DP], error) {
 	defer func() {
 		sd.indexedDepsByTypeAndID = map[trace.DependencyType]map[ID]SmartDependency[T, CP, SP, DP]{}
 		sd.unindexedDeps = nil
 	}()
-	metrics := newMetrics()
+	metrics := newMetrics[T, CP, SP, DP](sd.t.DefaultNamer())
 	for _, dep := range sd.depsInDefinitionOrder {
 		if err := dep.close(sd.t, metrics); err != nil {
 			return nil, err

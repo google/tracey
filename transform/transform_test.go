@@ -1,17 +1,17 @@
 /*
-	Copyright 2024 Google Inc.
+  Copyright 2024 Google Inc.
 
-	Licensed under the Apache License, Version 2.0 (the "License");
-	you may not use this file except in compliance with the License.
-	You may obtain a copy of the License at
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
 
-			http://www.apache.org/licenses/LICENSE-2.0
+      http://www.apache.org/licenses/LICENSE-2.0
 
-	Unless required by applicable law or agreed to in writing, software
-	distributed under the License is distributed on an "AS IS" BASIS,
-	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
-	limitations under the License.
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
 */
 
 package transform
@@ -23,14 +23,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/tracey/test_trace"
 	"github.com/google/tracey/trace"
-	"github.com/google/go-cmp/cmp"
+	traceparser "github.com/google/tracey/trace/parser"
 )
 
-func spanFinder(t *testing.T, pathMatcherStrs ...string) *trace.SpanFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
+func spanFinderPattern(t *testing.T, pathMatcherStrs ...string) *traceparser.SpanPattern {
 	t.Helper()
-	ret, err := testtrace.SpanFinderFromPattern(pathMatcherStrs)
+	ret, err := traceparser.ParseSpanSpecifierPatterns(trace.SpanOnlyHierarchyType, strings.Join(pathMatcherStrs, "/"))
 	if err != nil {
 		t.Fatalf("failed to parse path pattern: %s", err)
 	}
@@ -53,6 +54,9 @@ func prettyPrintSpanSelection(
 	namer trace.Namer[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 ) string {
 	spans := ss.Spans()
+	sort.Slice(spans, func(a, b int) bool {
+		return namer.SpanUniqueID(spans[a]) < namer.SpanUniqueID(spans[b])
+	})
 	ret := make([]string, len(spans))
 	for idx, span := range spans {
 		ret[idx] = prettyPrintSpan(span, namer)
@@ -85,7 +89,7 @@ func prettyPrintDependencySelection(
 	})
 	dtsStrs := make([]string, len(dts))
 	for idx, dt := range dts {
-		dtsStrs[idx] = trace.DefaultNamer().DependencyTypeNames()[dt]
+		dtsStrs[idx] = trace.DefaultNamer().DependencyTypes().TypeData(dt).Name
 	}
 	return fmt.Sprintf(
 		"types [%s] %s -> %s",
@@ -105,16 +109,29 @@ func prettyPrintAppliedDependencyModifications(
 		fmt.Sprintf(" scale * %.2f%%", adm.mdt.durationScalingFactor*100.0)
 }
 
+// MomentString returns a string representing the moment portion of the
+// position.  For testing purposes only.
+func prettyPrintPositionMomentString(p *traceparser.PositionPattern) string {
+	if fractionThrough, ok := p.PositionPattern().SpanFraction(); ok {
+		return fmt.Sprintf("%.2f%%", fractionThrough*100.0)
+	} else if markRegexp, ok := p.PositionPattern().MarkRegexp(); ok {
+		return fmt.Sprintf("(%s)", markRegexp)
+	}
+	return fmt.Sprintf("<unknown moment>")
+}
+
 func prettyPrintAppliedDependencyAdditions(
 	indent string,
 	ada *appliedDependencyAdditions[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 	trace trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 ) string {
 	return indent +
-		fmt.Sprintf("type %v %s@%.2f%% -> %s@%.2f%%",
+		fmt.Sprintf("type %v %s@%s -> %s@%s",
 			ada.adt.dependencyType,
-			prettyPrintSpan(ada.originSpan, trace.DefaultNamer()), ada.adt.originPosition.FractionThrough()*100.0,
-			prettyPrintSpanSelection(ada.selectedDestinationSpans, trace.DefaultNamer()), ada.adt.destinationPosition.FractionThrough()*100.0,
+			prettyPrintSpan(ada.originSpan, trace.DefaultNamer()),
+			prettyPrintPositionMomentString(ada.adt.originPositionPattern),
+			prettyPrintSpanSelection(ada.destinationSelection, trace.DefaultNamer()),
+			prettyPrintPositionMomentString(ada.adt.destinationPositionPattern),
 		)
 }
 
@@ -191,14 +208,14 @@ func TestTransformationConstruction(t *testing.T) {
 		buildTrace: testtrace.Trace1,
 		wantAppliedTransformStr: `
 applied span modifications:
-  [s0.0.0, s0.1.0, s1.0.0, s0.0.0/0, s0.0.0/0/3] start as early as possible
+  [s0.0.0/0, s0.0.0/0/3, s0.0.0, s0.1.0, s1.0.0] start as early as possible
 applied dependency modifications:
-  types [call, return, spawn, send, signal] [s0.0.0, s0.1.0, s1.0.0, s0.0.0/0, s0.0.0/0/3] -> [s0.0.0, s0.1.0, s1.0.0, s0.0.0/0, s0.0.0/0/3] scale * 0.00%`,
+  types [call, return, spawn, send, signal] [s0.0.0/0, s0.0.0/0/3, s0.0.0, s0.1.0, s1.0.0] -> [s0.0.0/0, s0.0.0/0/3, s0.0.0, s0.1.0, s1.0.0] scale * 0.00%`,
 	}, {
 		description: "testtrace.Trace1, s0.1.0 is 50% faster",
 		transform: New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 			WithSpansScaledBy(
-				spanFinder(t, "s0.1.0"),
+				spanFinderPattern(t, "s0.1.0"),
 				.5,
 			),
 		buildTrace: testtrace.Trace1,
@@ -225,6 +242,18 @@ applied span modifications:
 			}
 		})
 	}
+}
+
+func posSpec(t *testing.T, spec string) *traceparser.PositionPattern {
+	t.Helper()
+	positionPattern, err := traceparser.ParsePositionSpecifiers(
+		trace.SpanOnlyHierarchyType,
+		spec,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	return positionPattern
 }
 
 func TestTraceTransforms(t *testing.T) {
@@ -262,7 +291,7 @@ func TestTraceTransforms(t *testing.T) {
 				t.Fatalf("failed to build trace: %s", err.Error())
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
-				WithSpansScaledBy(spanFinder(t, "a"), .5)
+				WithSpansScaledBy(spanFinderPattern(t, "a"), .5)
 			transformedTrace, err := transformation.TransformTrace(originalTrace)
 			return transformedTrace, err
 		},
@@ -300,7 +329,7 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithDependenciesScaledBy(
-					spanFinder(t, "a"), spanFinder(t, "b"),
+					spanFinderPattern(t, "a"), spanFinderPattern(t, "b"),
 					dependencyTypes(testtrace.Send),
 					2,
 				)
@@ -319,7 +348,7 @@ Trace spans:
       50ns-60ns <none> -> THIS -> <none>
       70ns-110ns [send from a @50ns] -> THIS -> <none>`,
 	}, {
-		description: "added dependency",
+		description: "added dependency via fractions",
 		buildTrace: func() (
 			trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 			error,
@@ -351,8 +380,69 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "b"), 0.8),
-					trace.NewPosition(spanFinder(t, "c"), 0.0),
+					posSpec(t, "b @80%"),
+					posSpec(t, "c @0%"),
+					testtrace.Signal,
+					0, // The new dependencies are 0-duration...
+				)
+			transformedTrace, err := transformation.TransformTrace(originalTrace)
+			return transformedTrace, err
+		},
+		hierarchyType: testtrace.None,
+		wantTraceStr: `
+Trace spans:
+  Span 'a' (0s-50ns) (a)
+    Elementary spans:
+      0s-20ns <none> -> THIS -> [send to b @30ns]
+      20ns-50ns <none> -> THIS -> [signal to c @50ns]
+  Span 'b' (0s-100ns) (b)
+    Elementary spans:
+      0s-30ns <none> -> THIS -> <none>
+      30ns-80ns [send from a @20ns] -> THIS -> [signal to c @80ns]
+      80ns-100ns <none> -> THIS -> <none>
+  Span 'c' (50ns-130ns) (c)
+    Elementary spans:
+      50ns-50ns [signal from a @50ns] -> THIS -> <none>
+      80ns-130ns [signal from b @80ns] -> THIS -> <none>`,
+	}, {
+		description: "added dependency via marks",
+		buildTrace: func() (
+			trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
+			error,
+		) {
+			var err error
+			originalTrace := testtrace.NewTraceBuilderWithErrorHandler(func(gotErr error) {
+				err = gotErr
+			}).
+				WithRootSpans(
+					testtrace.RootSpan(0, 50, "a", testtrace.ParentCategories()),
+					testtrace.RootSpan(0, 100, "b", testtrace.ParentCategories(),
+						testtrace.Mark("origin", 80),
+					),
+					testtrace.RootSpan(50, 100, "c", testtrace.ParentCategories(),
+						testtrace.Mark("destination", 50),
+					),
+				).
+				WithDependency(
+					testtrace.Send,
+					"",
+					testtrace.Origin(testtrace.Paths("a"), 20),
+					testtrace.Destination(testtrace.Paths("b"), 30),
+				).
+				WithDependency(
+					testtrace.Signal,
+					"",
+					testtrace.Origin(testtrace.Paths("a"), 50),
+					testtrace.Destination(testtrace.Paths("c"), 50),
+				).
+				Build()
+			if err != nil {
+				t.Fatalf("failed to build trace: %s", err.Error())
+			}
+			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
+				WithAddedDependencies(
+					posSpec(t, "b @(origin)"),
+					posSpec(t, "c @(destination)"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				)
@@ -404,15 +494,15 @@ Trace spans:
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				// Now multiple incoming deps in c @ 50
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "b"), 1.0),
-					trace.NewPosition(spanFinder(t, "c"), 0.0),
+					posSpec(t, "b @100%"),
+					posSpec(t, "c @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				).
 				// Now multiple outgoing deps in a @ 50
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "a"), 1.0),
-					trace.NewPosition(spanFinder(t, "d"), 0.0),
+					posSpec(t, "a @100%"),
+					posSpec(t, "d @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				)
@@ -437,7 +527,7 @@ Trace spans:
     Elementary spans:
       50ns-100ns [signal from a @50ns] -> THIS -> <none>`,
 	}, {
-		description: "added dependencies without matching endpoints are dropped",
+		description: "added dependencies without matching endpoints error",
 		buildTrace: func() (
 			trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 			error,
@@ -457,21 +547,21 @@ Trace spans:
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				// This dep should be added...
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "a"), 1.0),
-					trace.NewPosition(spanFinder(t, "b"), 0.0),
+					posSpec(t, "a @100%"),
+					posSpec(t, "b @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				).
 				// But these can't be.
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "c"), 1.0),
-					trace.NewPosition(spanFinder(t, "b"), 0.0),
+					posSpec(t, "c @100%"),
+					posSpec(t, "b @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				).
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "a"), 1.0),
-					trace.NewPosition(spanFinder(t, "d"), 0.0),
+					posSpec(t, "a @100%"),
+					posSpec(t, "d @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				)
@@ -479,14 +569,7 @@ Trace spans:
 			return transformedTrace, err
 		},
 		hierarchyType: testtrace.None,
-		wantTraceStr: `
-Trace spans:
-  Span 'a' (0s-50ns) (a)
-    Elementary spans:
-      0s-50ns <none> -> THIS -> [signal to b @50ns]
-  Span 'b' (50ns-100ns) (b)
-    Elementary spans:
-      50ns-100ns [signal from a @50ns] -> THIS -> <none>`,
+		wantErr:       true,
 	}, {
 		description: "adjusted start",
 		buildTrace: func() (
@@ -512,7 +595,7 @@ Trace spans:
 				t.Fatalf("failed to build trace: %s", err.Error())
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
-				WithSpansStartingAsEarlyAsPossible(spanFinder(t, "a"))
+				WithSpansStartingAsEarlyAsPossible(spanFinderPattern(t, "a"))
 			transformedTrace, err := transformation.TransformTrace(originalTrace)
 			return transformedTrace, err
 		},
@@ -552,10 +635,10 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithRemovedDependencies(
-					spanFinder(t, "a"), spanFinder(t, "b"),
+					spanFinderPattern(t, "a"), spanFinderPattern(t, "b"),
 					dependencyTypes(testtrace.Send),
 				).
-				WithSpansStartingAsEarlyAsPossible(spanFinder(t, "b"))
+				WithSpansStartingAsEarlyAsPossible(spanFinderPattern(t, "b"))
 
 			transformedTrace, err := transformation.TransformTrace(originalTrace)
 			return transformedTrace, err
@@ -595,16 +678,16 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithRemovedDependencies(
-					spanFinder(t, "a"), spanFinder(t, "b"),
+					spanFinderPattern(t, "a"), spanFinderPattern(t, "b"),
 					nil,
 				).
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "b"), 1.0),
-					trace.NewPosition(spanFinder(t, "a"), 0.0),
+					posSpec(t, "b @100%"),
+					posSpec(t, "a @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				).
-				WithSpansStartingAsEarlyAsPossible(spanFinder(t, "b"))
+				WithSpansStartingAsEarlyAsPossible(spanFinderPattern(t, "b"))
 			transformedTrace, err := transformation.TransformTrace(originalTrace)
 			return transformedTrace, err
 		},
@@ -654,11 +737,11 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithSpansScaledBy(
-					spanFinder(t, "dest-shrink", "dest-noshrink"),
+					spanFinderPattern(t, "dest-shrink,dest-noshrink"),
 					.5,
 				).
 				WithShrinkableIncomingDependencies(
-					spanFinder(t, "dest-shrink"),
+					spanFinderPattern(t, "dest-shrink"),
 					nil,
 					2,
 				)
@@ -679,9 +762,9 @@ Trace spans:
       40ns-55ns [send from source @5ns] -> THIS -> <none>
   Span 'source' (0s-10ns) (source)
     Elementary spans:
-      0s-5ns <none> -> THIS -> [send to dest-noshrink @60ns]
+      0s-5ns <none> -> THIS -> [send to dest-shrink @35ns]
       5ns-5ns <none> -> THIS -> [send to dest-shrink @40ns]
-      5ns-5ns <none> -> THIS -> [send to dest-shrink @35ns]
+      5ns-5ns <none> -> THIS -> [send to dest-noshrink @60ns]
       5ns-10ns <none> -> THIS -> <none>`,
 	}, {
 		description: "transformations introducing loops fail",
@@ -704,8 +787,8 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "b"), 0.30),
-					trace.NewPosition(spanFinder(t, "a"), 0.10),
+					posSpec(t, "b @30%"),
+					posSpec(t, "a @10%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				)
@@ -734,7 +817,7 @@ Trace spans:
 				t.Fatalf("failed to build trace: %s", err.Error())
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
-				WithSpansGatedBy(spanFinder(t, "a"),
+				WithSpansGatedBy(spanFinderPattern(t, "a"),
 					func() SpanGater[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
 						return &concurrencyLimiter[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 							allowedConcurrency: 0,
@@ -746,7 +829,7 @@ Trace spans:
 		hierarchyType: testtrace.None,
 		wantErr:       true,
 	}, {
-		description: "add-dependency transform with multiple origins is dropped",
+		description: "add-dependency transform with multiple origins errors",
 		buildTrace: func() (
 			trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 			error,
@@ -766,8 +849,8 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "*"), 0.80),
-					trace.NewPosition(spanFinder(t, "c"), 0.0),
+					posSpec(t, "* @80%"),
+					posSpec(t, "c @0%"),
 					testtrace.Signal,
 					0, // The new dependencies are 0-duration...
 				)
@@ -775,16 +858,7 @@ Trace spans:
 			return transformedTrace, err
 		},
 		hierarchyType: testtrace.None,
-		wantTraceStr: `
-Trace spans:
-  Span 'a' (0s-100ns) (a)
-    Elementary spans:
-      0s-20ns <none> -> THIS -> [send to b @20ns]
-      20ns-100ns <none> -> THIS -> <none>
-  Span 'b' (0s-100ns) (b)
-    Elementary spans:
-      0s-20ns <none> -> THIS -> <none>
-      20ns-100ns [send from a @20ns] -> THIS -> <none>`,
+		wantErr:       true,
 	}, {
 		description: "limit concurrency to 1 between 'a' and 'b'",
 		buildTrace: func() (
@@ -818,7 +892,7 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithSpansGatedBy(
-					spanFinder(t, "a", "b"),
+					spanFinderPattern(t, "a,b"),
 					func() SpanGater[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
 						return &concurrencyLimiter[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 							allowedConcurrency: 1,
@@ -874,12 +948,8 @@ Trace spans:
 			}
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithSpansGatedBy(
-					spanFinder(t, "a", "b", "c"),
-					func() SpanGater[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
-						return &concurrencyLimiter[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
-							allowedConcurrency: 2,
-						}
-					},
+					spanFinderPattern(t, "a/b/c"),
+					NewConcurrencyLimiter[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](2),
 				)
 			transformedTrace, err := transformation.TransformTrace(originalTrace)
 			return transformedTrace, err
@@ -984,7 +1054,9 @@ Trace spans:
   Span 's0.0.0' (0s-90ns) (s0.0.0)
     Elementary spans:
       0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+        'start' @0s
       80ns-90ns [return from s0.0.0/0 @80ns] -> THIS -> <none>
+        'end' @90ns
     Span '0' (10ns-80ns) (s0.0.0/0)
       Elementary spans:
         10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @20ns]
@@ -1012,7 +1084,7 @@ Trace spans:
 		) {
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithSpansScaledBy(
-					spanFinder(t, "s0.1.0"),
+					spanFinderPattern(t, "s0.1.0"),
 					.5,
 				)
 			originalTrace, err := testtrace.Trace1()
@@ -1028,7 +1100,9 @@ Trace spans:
   Span 's0.0.0' (0s-95ns) (s0.0.0)
     Elementary spans:
       0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+        'start' @0s
       85ns-95ns [return from s0.0.0/0 @85ns] -> THIS -> <none>
+        'end' @95ns
     Span '0' (10ns-85ns) (s0.0.0/0)
       Elementary spans:
         10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
@@ -1056,8 +1130,8 @@ Trace spans:
 		) {
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithAddedDependencies(
-					trace.NewPosition(spanFinder(t, "s1.0.0"), 1.0),
-					trace.NewPosition(spanFinder(t, "s0.1.0"), 0.30),
+					posSpec(t, "s1.0.0 @100%"),
+					posSpec(t, "s0.1.0 @30%"),
 					testtrace.Signal,
 					2, // The new dependencies have duration of 2ns...
 				)
@@ -1071,26 +1145,28 @@ Trace spans:
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
 Trace spans:
-  Span 's0.0.0' (0s-110ns) (s0.0.0)
+  Span 's0.0.0' (0s-111ns) (s0.0.0)
     Elementary spans:
       0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
-      100ns-110ns [return from s0.0.0/0 @100ns] -> THIS -> <none>
-    Span '0' (10ns-100ns) (s0.0.0/0)
+        'start' @0s
+      101ns-111ns [return from s0.0.0/0 @101ns] -> THIS -> <none>
+        'end' @111ns
+    Span '0' (10ns-101ns) (s0.0.0/0)
       Elementary spans:
         10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
         20ns-30ns <none> -> THIS -> [spawn to s1.0.0 @30ns]
         30ns-40ns <none> -> THIS -> [call to s0.0.0/0/3 @40ns]
-        80ns-100ns [return from s0.0.0/0/3 @80ns] -> THIS -> [return to s0.0.0 @100ns]
-      Span '3' (40ns-80ns) (s0.0.0/0/3)
+        81ns-101ns [return from s0.0.0/0/3 @81ns] -> THIS -> [return to s0.0.0 @101ns]
+      Span '3' (40ns-81ns) (s0.0.0/0/3)
         Elementary spans:
           40ns-50ns [call from s0.0.0/0 @40ns] -> THIS -> <none>
-          70ns-80ns [signal from s0.1.0 @60ns] -> THIS -> [return to s0.0.0/0 @80ns]
-  Span 's0.1.0' (30ns-80ns) (s0.1.0)
+          71ns-81ns [signal from s0.1.0 @61ns] -> THIS -> [return to s0.0.0/0 @81ns]
+  Span 's0.1.0' (30ns-81ns) (s0.1.0)
     Elementary spans:
       30ns-40ns [spawn from s0.0.0/0 @20ns] -> THIS -> <none>
-      40ns-42ns [send from s1.0.0 @35ns] -> THIS -> <none>
-      52ns-60ns [signal from s1.0.0 @50ns] -> THIS -> [signal to s0.0.0/0/3 @70ns]
-      60ns-80ns <none> -> THIS -> <none>
+      40ns-41ns [send from s1.0.0 @35ns] -> THIS -> <none>
+      52ns-61ns [signal from s1.0.0 @50ns] -> THIS -> [signal to s0.0.0/0/3 @71ns]
+      61ns-81ns <none> -> THIS -> <none>
   Span 's1.0.0' (30ns-50ns) (s1.0.0)
     Elementary spans:
       30ns-35ns [spawn from s0.0.0/0 @30ns] -> THIS -> [send to s0.1.0 @40ns]
@@ -1103,7 +1179,7 @@ Trace spans:
 		) {
 			transformation := New[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]().
 				WithRemovedDependencies(
-					spanFinder(t, "s0.1.0"), spanFinder(t, "s0.0.0/0/3"),
+					spanFinderPattern(t, "s0.1.0"), spanFinderPattern(t, "s0.0.0/0/3"),
 					dependencyTypes(testtrace.Signal),
 				)
 			originalTrace, err := testtrace.Trace1()
@@ -1119,7 +1195,9 @@ Trace spans:
   Span 's0.0.0' (0s-90ns) (s0.0.0)
     Elementary spans:
       0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+        'start' @0s
       80ns-90ns [return from s0.0.0/0 @80ns] -> THIS -> <none>
+        'end' @90ns
     Span '0' (10ns-80ns) (s0.0.0/0)
       Elementary spans:
         10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]

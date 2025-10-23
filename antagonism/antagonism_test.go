@@ -23,10 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/tracey/critical_path"
 	"github.com/google/tracey/test_trace"
 	"github.com/google/tracey/trace"
-	"github.com/google/go-cmp/cmp"
+	traceparser "github.com/google/tracey/trace/parser"
 )
 
 type testVictim struct {
@@ -137,15 +138,65 @@ func (tl *testLogger) prettyPrint() string {
 }
 
 func pm(
-	pms ...trace.PathElementMatcher[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
-) []trace.PathElementMatcher[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
+	pms ...trace.PathElementMatcher,
+) []trace.PathElementMatcher {
 	return pms
 }
 
 func pms(
-	pms ...[]trace.PathElementMatcher[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
-) [][]trace.PathElementMatcher[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload] {
+	pms ...[]trace.PathElementMatcher,
+) [][]trace.PathElementMatcher {
 	return pms
+}
+
+func criticalAntagonismsFunction(cpSpanPattern ...string) func(t trace.Wrapper[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]) (
+	[]trace.ElementarySpan[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
+	error,
+) {
+	return func(t trace.Wrapper[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]) (
+		[]trace.ElementarySpan[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
+		error,
+	) {
+		rootSpanPattern, err := traceparser.ParseSpanSpecifierPatterns(trace.SpanOnlyHierarchyType, strings.Join(cpSpanPattern, "/"))
+		if err != nil {
+			return nil, err
+		}
+		rootSpanFinder, err := traceparser.NewSpanFinder(rootSpanPattern, t.Trace())
+		if err != nil {
+			return nil, err
+		}
+		rootSpans := rootSpanFinder.FindSpans()
+		if len(rootSpans) != 1 {
+			return nil, fmt.Errorf("expected exactly one span matching '%s'; got %d", strings.Join(cpSpanPattern, "/"), len(rootSpans))
+		}
+		path, err := criticalpath.FindBetweenEndpoints(
+			t.Trace(),
+			&criticalpath.Endpoint[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
+				Span: rootSpans[0],
+				At:   rootSpans[0].Start(),
+			},
+			&criticalpath.Endpoint[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
+				Span: rootSpans[0],
+				At:   rootSpans[0].End(),
+			},
+			criticalpath.PreferMostWork,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return path.CriticalPath, nil
+	}
+}
+
+func spanSpec(t *testing.T, spec string) *traceparser.SpanPattern {
+	t.Helper()
+	sp, err := traceparser.ParseSpanSpecifierPatterns(
+		trace.SpanOnlyHierarchyType, spec,
+	)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	return sp
 }
 
 func TestFindAntagonisms(t *testing.T) {
@@ -188,16 +239,8 @@ func TestFindAntagonisms(t *testing.T) {
 		},
 		antagonismGroups: []*Group[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 			NewGroup[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]("all").
-				WithVictimFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				).
-				WithAntagonistFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				),
+				WithVictimSpanPattern(spanSpec(t, "**")).
+				WithAntagonistSpanPattern(spanSpec(t, "**")),
 		},
 		wantAntagonistsStr: `Antagonism group 'all':
   Victim a2:
@@ -231,16 +274,8 @@ func TestFindAntagonisms(t *testing.T) {
 		},
 		antagonismGroups: []*Group[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 			NewGroup[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]("all").
-				WithVictimFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				).
-				WithAntagonistFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				),
+				WithVictimSpanPattern(spanSpec(t, "**")).
+				WithAntagonistSpanPattern(spanSpec(t, "**")),
 		},
 		wantAntagonistsStr: `Antagonism group 'all':
   Victim a:
@@ -272,16 +307,8 @@ func TestFindAntagonisms(t *testing.T) {
 		},
 		antagonismGroups: []*Group[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 			NewGroup[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]("all").
-				WithVictimFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				).
-				WithAntagonistFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				),
+				WithVictimSpanPattern(spanSpec(t, "**")).
+				WithAntagonistSpanPattern(spanSpec(t, "**")),
 		},
 		wantAntagonistsStr: `Antagonism group 'all':
   Victim a:
@@ -289,49 +316,121 @@ func TestFindAntagonisms(t *testing.T) {
   Victim b:
     antagonised by a: 40ns`,
 	}, {
+		description: "simple critical antagonism",
+		buildTrace: func() (
+			trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
+			error,
+		) {
+			var err error
+			tr := testtrace.NewTraceBuilderWithErrorHandler(func(gotErr error) {
+				err = gotErr
+			}).
+				WithRootSpans(
+					testtrace.RootSpan(0, 100, "a", nil,
+						testtrace.Span(10, 90, "b"),
+					),
+					testtrace.RootSpan(30, 70, "c", nil),
+					testtrace.RootSpan(10, 90, "d", nil),
+				).
+				// b suspends just longer than its spawn to c,
+				WithSuspend(testtrace.Paths("a", "b"), 15, 31).
+				// and again just longer than c's signal back to it.  This ensures b
+				// doesn't make the max-work critical path.
+				WithSuspend(testtrace.Paths("a", "b"), 69, 80).
+				WithDependency(
+					testtrace.Spawn, "",
+					testtrace.Origin(testtrace.Paths("a", "b"), 15),
+					testtrace.Destination(testtrace.Paths("c"), 30),
+				).
+				WithDependency(
+					testtrace.Signal, "",
+					testtrace.Origin(testtrace.Paths("c"), 70),
+					testtrace.Destination(testtrace.Paths("a", "b"), 80),
+				).
+				Build()
+				/*
+					Trace (Span-only):
+						Span 'a' (0s-100ns) (a)
+							Elementary spans:
+								0s-10ns <none> -> THIS -> [call to a/b @10ns]
+								10ns-10ns <none> -> THIS -> <none>
+								90ns-100ns [return from a/b @90ns] -> THIS -> <none>
+							Span 'b' (10ns-90ns) (a/b)
+								Elementary spans:
+									10ns-15ns [call from a @10ns] -> THIS -> [spawn to c @30ns]
+									31ns-69ns <none> -> THIS -> <none>
+									80ns-90ns [signal from c @70ns] -> THIS -> [return to a @90ns]
+						Span 'c' (30ns-70ns) (c)
+							Elementary spans:
+								30ns-70ns [spawn from a/b @15ns] -> THIS -> [signal to a/b @80ns]
+						Span 'd' (10ns-90ns) (d)
+							Elementary spans:
+								10ns-90ns <none> -> THIS -> <none>
+
+					The end-to-end max-work critical span of 'a' will then be:
+						a: 0s-10ns    (nothing else running)
+						b: 10ns-15ns  (no initial delay)
+						c: 30ns-70ns  (antagonized by d for 15ns)
+						b: 80ns-90ns  (antagonized by d for 10ns)
+						a: 90ns-100ns (nothing else running)
+				*/
+			return tr, err
+		},
+		antagonismGroups: []*Group[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
+			NewGroup[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]("critical victims vs all").
+				WithVictimElementarySpansFn(
+					criticalAntagonismsFunction("a"),
+				).
+				WithAntagonistSpanPattern(spanSpec(t, "**")),
+		}, wantAntagonistsStr: `Antagonism group 'critical victims vs all':
+  Victim b:
+    antagonised by d: 10ns
+  Victim c:
+    antagonised by d: 15ns`,
+	}, {
 		description: "critical antagonisms",
 		/*
-			Trace1 is:
-				Category 'p0' (p0)
-					Category 't0.0' (p0/t0.0)
-						Category 'r0.0.0' (p0/t0.0/r0.0.0)
-							Span 's0.0.0' (0s-100ns) (s0.0.0)
-								Elementary spans:
-									0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
-									90ns-100ns [return from s0.0.0/0 @90ns] -> THIS -> <none>
-								Span '0' (10ns-90ns) (s0.0.0/0)
-									Elementary spans:
-										10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
-										20ns-30ns <none> -> THIS -> [spawn to s1.0.0 @30ns]
-										30ns-40ns <none> -> THIS -> [call to s0.0.0/0/3 @40ns]
-										70ns-90ns [return from s0.0.0/0/3 @70ns] -> THIS -> [return to s0.0.0 @90ns]
-									Span '3' (40ns-70ns) (s0.0.0/0/3)
-										Elementary spans:
-											40ns-50ns [call from s0.0.0/0 @40ns] -> THIS -> <none>
-											60ns-70ns [signal from s0.1.0 @50ns] -> THIS -> [return to s0.0.0/0 @70ns]
-						Category 't0.1' (p0/t0.0/t0.1)
-							Category 'r0.1.0' (p0/t0.0/t0.1/r0.1.0)
-								Span 's0.1.0' (30ns-70ns) (s0.1.0)
-									Elementary spans:
-										30ns-40ns [spawn from s0.0.0/0 @20ns] -> THIS -> <none>
-										40ns-50ns [send from s1.0.0 @35ns] -> THIS -> [signal to s0.0.0/0/3 @60ns]
-										50ns-70ns <none> -> THIS -> <none>
-					Category 'p1' (p0/p1)
-						Category 't1.0' (p0/p1/t1.0)
-							Category 'r1.0.0' (p0/p1/t1.0/r1.0.0)
-								Span 's1.0.0' (30ns-50ns) (s1.0.0)
-									Elementary spans:
-										30ns-35ns [spawn from s0.0.0/0 @30ns] -> THIS -> [send to s0.1.0 @40ns]
-										35ns-50ns <none> -> THIS -> <none>
-			In Trace1, span s0.0.0's end-to-end max work critical path is:
-				s0.0.0: 0s-10ns     (nothing else running)
-				0: 10ns-20ns        (no initial delay)
-				0: 20ns-30ns        (no initial delay)
-				0: 30ns-40ns        (no initial delay)
-				3: 40ns-50ns        (no initial delay)
-				3: 60ns-70ns        (antagonized for 10ns by s0.1.0)
-				0: 70ns-90ns        (no initial delay)
-				s0.0.0: 90ns-100ns  (nothing else running)
+		   Trace1 is:
+		     Category 'p0' (p0)
+		       Category 't0.0' (p0/t0.0)
+		         Category 'r0.0.0' (p0/t0.0/r0.0.0)
+		           Span 's0.0.0' (0s-100ns) (s0.0.0)
+		             Elementary spans:
+		               0s-10ns <none> -> THIS -> [call to s0.0.0/0 @10ns]
+		               90ns-100ns [return from s0.0.0/0 @90ns] -> THIS -> <none>
+		             Span '0' (10ns-90ns) (s0.0.0/0)
+		               Elementary spans:
+		                 10ns-20ns [call from s0.0.0 @10ns] -> THIS -> [spawn to s0.1.0 @30ns]
+		                 20ns-30ns <none> -> THIS -> [spawn to s1.0.0 @30ns]
+		                 30ns-40ns <none> -> THIS -> [call to s0.0.0/0/3 @40ns]
+		                 70ns-90ns [return from s0.0.0/0/3 @70ns] -> THIS -> [return to s0.0.0 @90ns]
+		               Span '3' (40ns-70ns) (s0.0.0/0/3)
+		                 Elementary spans:
+		                   40ns-50ns [call from s0.0.0/0 @40ns] -> THIS -> <none>
+		                   60ns-70ns [signal from s0.1.0 @50ns] -> THIS -> [return to s0.0.0/0 @70ns]
+		         Category 't0.1' (p0/t0.0/t0.1)
+		           Category 'r0.1.0' (p0/t0.0/t0.1/r0.1.0)
+		             Span 's0.1.0' (30ns-70ns) (s0.1.0)
+		               Elementary spans:
+		                 30ns-40ns [spawn from s0.0.0/0 @20ns] -> THIS -> <none>
+		                 40ns-50ns [send from s1.0.0 @35ns] -> THIS -> [signal to s0.0.0/0/3 @60ns]
+		                 50ns-70ns <none> -> THIS -> <none>
+		       Category 'p1' (p0/p1)
+		         Category 't1.0' (p0/p1/t1.0)
+		           Category 'r1.0.0' (p0/p1/t1.0/r1.0.0)
+		             Span 's1.0.0' (30ns-50ns) (s1.0.0)
+		               Elementary spans:
+		                 30ns-35ns [spawn from s0.0.0/0 @30ns] -> THIS -> [send to s0.1.0 @40ns]
+		                 35ns-50ns <none> -> THIS -> <none>
+		   In Trace1, span s0.0.0's end-to-end max work critical path is:
+		     s0.0.0: 0s-10ns     (nothing else running)
+		     0: 10ns-20ns        (no initial delay)
+		     0: 20ns-30ns        (no initial delay)
+		     0: 30ns-40ns        (no initial delay)
+		     3: 40ns-50ns        (no initial delay)
+		     3: 60ns-70ns        (antagonized for 10ns by s0.1.0)
+		     0: 70ns-90ns        (no initial delay)
+		     s0.0.0: 90ns-100ns  (nothing else running)
 		*/
 		buildTrace: testtrace.Trace1,
 		antagonismGroups: []*Group[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
@@ -341,17 +440,20 @@ func TestFindAntagonisms(t *testing.T) {
 						[]trace.ElementarySpan[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload],
 						error,
 					) {
-						rootSpanFinder, err := testtrace.SpanFinderFromPattern([]string{"s0.0.0"})
+						rootSpanPattern, err := traceparser.ParseSpanSpecifierPatterns(trace.SpanOnlyHierarchyType, "s0.0.0")
 						if err != nil {
 							return nil, err
 						}
-						rootSpans := rootSpanFinder.Find(t.Trace())
+						rootSpanFinder, err := traceparser.NewSpanFinder(rootSpanPattern, t.Trace())
+						if err != nil {
+							return nil, err
+						}
+						rootSpans := rootSpanFinder.FindSpans()
 						if len(rootSpans) != 1 {
 							return nil, fmt.Errorf("expected exactly one span matching 's0.0.0'; got %d", len(rootSpans))
 						}
-						return criticalpath.FindBetweenEndpoints(
-							trace.DurationComparator,
-							criticalpath.PreferMostWork,
+						path, err := criticalpath.FindBetweenEndpoints(
+							t.Trace(),
 							&criticalpath.Endpoint[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
 								Span: rootSpans[0],
 								At:   rootSpans[0].Start(),
@@ -360,14 +462,15 @@ func TestFindAntagonisms(t *testing.T) {
 								Span: rootSpans[0],
 								At:   rootSpans[0].End(),
 							},
+							criticalpath.PreferMostWork,
 						)
+						if err != nil {
+							return nil, err
+						}
+						return path.CriticalPath, nil
 					},
 				).
-				WithAntagonistFinder(
-					trace.NewSpanFinder(testtrace.TestNamer).WithSpanMatchers(
-						pm(trace.Globstar[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]()),
-					),
-				),
+				WithAntagonistSpanPattern(spanSpec(t, "**")),
 		},
 		wantAntagonistsStr: `Antagonism group 'critical victims vs all':
   Victim 3:

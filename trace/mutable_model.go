@@ -36,7 +36,7 @@ type MutableTrace[T any, CP, SP, DP fmt.Stringer] interface {
 	// Creates and returns a new MutableDependency of the
 	// specified type.  MutableDependency extends Dependency, adding the ability
 	// to link precomputed ElementarySpans.
-	NewMutableDependency(dependencyType DependencyType) MutableDependency[T, CP, SP, DP]
+	NewMutableDependency(dependencyType DependencyType, options ...DependencyOption) MutableDependency[T, CP, SP, DP]
 }
 
 // MutableSpan is a variant of Span which supports creation of mutable child
@@ -62,11 +62,21 @@ type MutableRootSpan[T any, CP, SP, DP fmt.Stringer] interface {
 	RootSpan[T, CP, SP, DP]
 }
 
+// MutableMark is a variant of Mark which supports mutation.
+type MutableMark[T any] interface {
+	Mark[T]
+
+	WithLabel(string) MutableMark[T]
+	WithMoment(T) MutableMark[T]
+}
+
 // MutableElementarySpan is a variant of ElementarySpan which supports external
 // mutation of the span's start and end points.
 type MutableElementarySpan[T any, CP, SP, DP fmt.Stringer] interface {
 	ElementarySpan[T, CP, SP, DP]
 
+	// Adds the provided marks, replacing any previous value.
+	WithMarks([]MutableMark[T]) MutableElementarySpan[T, CP, SP, DP]
 	// Sets the MutableElementarySpan's start point, replacing any previous
 	// value.
 	WithStart(start T) MutableElementarySpan[T, CP, SP, DP]
@@ -75,12 +85,6 @@ type MutableElementarySpan[T any, CP, SP, DP fmt.Stringer] interface {
 	// Sets the MutableElementarySpan's parent span, replacing any previous
 	// value.
 	withParentSpan(span MutableSpan[T, CP, SP, DP]) MutableElementarySpan[T, CP, SP, DP]
-	// Sets the MutableElementarySpan's incoming MutableDependency, replacing
-	// any previous value.
-	withIncoming(incoming MutableDependency[T, CP, SP, DP]) MutableElementarySpan[T, CP, SP, DP]
-	// Sets the MutableElementarySpan's outgoing MutableDependency, replacing
-	// any previous value.
-	withOutgoing(outgoing MutableDependency[T, CP, SP, DP]) MutableElementarySpan[T, CP, SP, DP]
 }
 
 // MutableDependency is a variant of Dependency which supports origin and
@@ -88,15 +92,22 @@ type MutableElementarySpan[T any, CP, SP, DP fmt.Stringer] interface {
 // implicitly by {Span, point} pairs.
 type MutableDependency[T any, CP, SP, DP fmt.Stringer] interface {
 	Dependency[T, CP, SP, DP]
+
 	// Sets the MutableDependency's payload.
 	WithPayload(payload DP) MutableDependency[T, CP, SP, DP]
-	// Sets the MutableDependency's origin MutableElementarySpan.  Returns an
-	// error if one already exists.
-	SetOriginElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) error
-	// Sets the MutableDependency's origin MutableElementarySpan, replacing any
-	// previous value.
-	WithOriginElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP]
+	// If the MutableDependency does not permit multiple origins, sets its origin
+	// MutableElementarySpan to the one provided, returning an error if one
+	// already exists.  Otherwise, adds the provided MutableElementarySpan to the
+	// MutableDependency's origins.
+	SetOriginElementarySpan(comparator Comparator[T], es MutableElementarySpan[T, CP, SP, DP]) error
+	// If the MutableDependency does not permit multiple origins, sets its origin
+	// MutableElementarySpan to the one provided, replacing any previous value.
+	// Otherwise, adds the provided MutableElementarySpan to the
+	// MutableDependency's origins.
+	WithOriginElementarySpan(comparator Comparator[T], es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP]
 	// Adds the provided MutableElementarySpan to the MutableDependency's
 	// destinations.
 	WithDestinationElementarySpan(es MutableElementarySpan[T, CP, SP, DP]) MutableDependency[T, CP, SP, DP]
+	// Replaces the origin elementary span with the provided new one.
+	replaceOriginElementarySpan(original, new MutableElementarySpan[T, CP, SP, DP])
 }
