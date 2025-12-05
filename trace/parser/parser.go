@@ -23,6 +23,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/google/tracey/spawning"
 	"github.com/google/tracey/trace"
 	"github.com/google/tracey/trace/parser/lexer"
 	"github.com/google/tracey/trace/parser/predicate"
@@ -30,9 +31,9 @@ import (
 )
 
 type result struct {
-	resultType         resultType
-	spanSpecifiers     *spanSpecifiers
-	positionSpecifiers *positionSpecifiers
+	resultType            resultType
+	spawningSpanSpecifier *spawningSpanSpecifier
+	positionSpecifiers    *positionSpecifiers
 }
 
 var (
@@ -53,6 +54,8 @@ var (
 		"||":                         op(OR),
 		"/":                          op(SLASH),
 		"%":                          op(PCT),
+		"->":                         op(DIRECTLY_SPAWNING),
+		"=>":                         op(INDIRECTLY_SPAWNING),
 		"(":                          op(LPAREN),
 		")":                          op(RPAREN),
 		",":                          op(COMMA),
@@ -76,6 +79,7 @@ var (
 
 var (
 	unquotedTerminationCharacters = map[rune]struct{}{
+		' ': struct{}{},
 		'/': struct{}{},
 		')': struct{}{},
 		'>': struct{}{},
@@ -88,7 +92,7 @@ var (
 func consumeFreeformString(input string, lvalue *yySymType) (ok bool, token int, consumed int, err error) {
 	offset := 0
 	escaped := false
-	str := ""
+	var str strings.Builder
 	for {
 		r, c := utf8.DecodeRuneInString(input[offset:])
 		if c == 0 {
@@ -99,12 +103,12 @@ func consumeFreeformString(input string, lvalue *yySymType) (ok bool, token int,
 		}
 		escaped = !escaped && r == '\\'
 		if !escaped {
-			str += string(r)
+			str.WriteString(string(r))
 		}
 		offset += c
 	}
 	if offset > 0 {
-		lvalue.str = strings.TrimSpace(str)
+		lvalue.str = strings.TrimSpace(str.String())
 		return true, STR, offset, nil
 	}
 	return false, 0, 0, nil
@@ -191,15 +195,15 @@ func buildPathElementMatchers(
 
 // SpanPattern specifies a pattern matching trace spans.
 type SpanPattern struct {
-	spanPattern *trace.SpanPattern
+	spanPattern *spawning.SpanPattern
 	predicate   *predicate.Predicate
 }
 
 // Returns a SpanPattern for the provided hierarchy type and spanSpecifiers.
-func buildSpanPattern(
+func buildSpanFinderPattern(
 	ht trace.HierarchyType,
 	spanSpecifiers *spanSpecifiers,
-) (*SpanPattern, error) {
+) (*trace.SpanPattern, error) {
 	var spanFinderOptions []trace.SpanPatternOption
 	for _, spanSpecifier := range spanSpecifiers.spanSpecifiers {
 		categoryMatchers, err := buildPathElementMatchers(spanSpecifier.categoryMatchers)
@@ -215,11 +219,66 @@ func buildSpanPattern(
 			trace.SpanAndCategoryMatchers(ht, categoryMatchers, spanMatchers),
 		)
 	}
-	ret := trace.NewSpanPattern(spanFinderOptions...)
+	return trace.NewSpanPattern(spanFinderOptions...), nil
+}
+
+// Returns a spawning.SpanFinderPattern for the provided hierarchy type and
+// spawningSpanSpecifiers.
+func buildSpawningSpanFinderPattern(
+	ht trace.HierarchyType,
+	spawningSpanSpecifiers *spawningSpanSpecifier,
+) (*SpanPattern, error) {
+	var spb *spawning.SpanPattern
+	if len(spawningSpanSpecifiers.spawningPathElements) > 0 {
+		sp, err := buildSpanFinderPattern(ht, spawningSpanSpecifiers.spawningPathElements[0].spanSpecifiers)
+		if err != nil {
+			return nil, err
+		}
+		spb = spawning.NewSpanPatternBuilder(sp)
+	}
+	for _, spawningPathElement := range spawningSpanSpecifiers.spawningPathElements[1:] {
+		sp, err := buildSpanFinderPattern(ht, spawningPathElement.spanSpecifiers)
+		if err != nil {
+			return nil, err
+		}
+		if spawningPathElement.directChild {
+			spb.DirectlySpawning(sp)
+		} else {
+			spb.EventuallySpawning(sp)
+		}
+	}
 	return &SpanPattern{
-		spanPattern: ret,
-		predicate:   spanSpecifiers.predicate,
+		spanPattern: spb,
+		predicate:   spawningSpanSpecifiers.predicate,
 	}, nil
+}
+
+type spanFinderOpts[T any, CP, SP, DP fmt.Stringer] struct {
+	fetchSpawningForest func() (*spawning.Forest[T, CP, SP, DP], error)
+}
+
+// SpanFinderOption is an option applied to NewSpanFinder.
+type SpanFinderOption[T any, CP, SP, DP fmt.Stringer] func(*spanFinderOpts[T, CP, SP, DP])
+
+// SpawningForestFetcher provides a fetcher function that can be invoked to
+// return a spawning forest.  This arrangement permits such forests to be
+// computed only on demand, but also cached for future use.
+func SpawningForestFetcher[T any, CP, SP, DP fmt.Stringer](
+	fetchSpawningForest func() (*spawning.Forest[T, CP, SP, DP], error),
+) SpanFinderOption[T, CP, SP, DP] {
+	return func(sfo *spanFinderOpts[T, CP, SP, DP]) {
+		sfo.fetchSpawningForest = fetchSpawningForest
+	}
+}
+
+func newSpanFinderOpts[T any, CP, SP, DP fmt.Stringer](
+	opts ...SpanFinderOption[T, CP, SP, DP],
+) *spanFinderOpts[T, CP, SP, DP] {
+	ret := &spanFinderOpts[T, CP, SP, DP]{}
+	for _, opt := range opts {
+		opt(ret)
+	}
+	return ret
 }
 
 // NewSpanFinder returns a new SpanFinder applying the provided SpanPattern to
@@ -227,7 +286,9 @@ func buildSpanPattern(
 func NewSpanFinder[T any, CP, SP, DP fmt.Stringer](
 	sp *SpanPattern,
 	t trace.Trace[T, CP, SP, DP],
+	opts ...SpanFinderOption[T, CP, SP, DP],
 ) (trace.SpanFinder[T, CP, SP, DP], error) {
+	sfo := newSpanFinderOpts(opts...)
 	if sp == nil {
 		return trace.NewSpanFinder(nil, t), nil
 	}
@@ -239,7 +300,17 @@ func NewSpanFinder[T any, CP, SP, DP fmt.Stringer](
 			return nil, fmt.Errorf("failed to generate span specifier predicate: %w", err)
 		}
 	}
-	return trace.NewSpanFinder(sp.spanPattern, t).WithSpanFilter(predicateFn), nil
+	if sp.spanPattern.SpecifiesSpawning() {
+		if sfo.fetchSpawningForest == nil {
+			return nil, fmt.Errorf("a spawning pattern was specified but a nil spawning forest fetcher was provided")
+		}
+		forest, err := sfo.fetchSpawningForest()
+		if err != nil {
+			return nil, fmt.Errorf("error fetching spawning forest: %w", err)
+		}
+		return spawning.NewSpanFinder(sp.spanPattern, t, forest).WithSpanFilter(predicateFn), nil
+	}
+	return trace.NewSpanFinder(sp.spanPattern.RootPattern(), t).WithSpanFilter(predicateFn), nil
 }
 
 // Parses the provided string, returning the completed lexer used in parsing.
@@ -285,7 +356,7 @@ func ParseSpanSpecifierPatterns(
 	if r.resultType != spanSpecifiersType {
 		return nil, fmt.Errorf("input '%s' is not a trace span specifier string", spanSpecifierStr)
 	}
-	return buildSpanPattern(ht, r.spanSpecifiers)
+	return buildSpawningSpanFinderPattern(ht, r.spawningSpanSpecifier)
 }
 
 // MustParseSpanSpecifiers works as ParseSpanSpecifiers, except that it
@@ -331,8 +402,9 @@ func (pp *PositionPattern) PositionPattern() *trace.PositionPattern {
 func SpanFinderFromPosition[T any, CP, SP, DP fmt.Stringer](
 	pp *PositionPattern,
 	t trace.Trace[T, CP, SP, DP],
+	opts ...SpanFinderOption[T, CP, SP, DP],
 ) (trace.SpanFinder[T, CP, SP, DP], error) {
-	return NewSpanFinder(pp.spanPattern, t)
+	return NewSpanFinder(pp.spanPattern, t, opts...)
 }
 
 // NewPositionFinder returns a new SpanFinder applying the provided SpanPattern to
@@ -340,8 +412,9 @@ func SpanFinderFromPosition[T any, CP, SP, DP fmt.Stringer](
 func NewPositionFinder[T any, CP, SP, DP fmt.Stringer](
 	pp *PositionPattern,
 	t trace.Trace[T, CP, SP, DP],
+	opts ...SpanFinderOption[T, CP, SP, DP],
 ) (trace.PositionFinder[T, CP, SP, DP], error) {
-	sf, err := SpanFinderFromPosition(pp, t)
+	sf, err := SpanFinderFromPosition(pp, t, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +425,7 @@ func buildPositionPattern(
 	ht trace.HierarchyType,
 	positionSpecifiers *positionSpecifiers,
 ) (*PositionPattern, error) {
-	spanPattern, err := buildSpanPattern(ht, positionSpecifiers.spanSpecifiers)
+	spanPattern, err := buildSpawningSpanFinderPattern(ht, positionSpecifiers.spawningSpanSpecifier)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +459,24 @@ func ParsePositionSpecifiers(
 	if r.resultType != positionSpecifiersType {
 		return nil, fmt.Errorf("input '%s' is not a trace position specifier string", positionSpecifierStr)
 	}
-	return buildPositionPattern(ht, r.positionSpecifiers)
+	spanPattern, err := buildSpawningSpanFinderPattern(ht, r.positionSpecifiers.spawningSpanSpecifier)
+	if err != nil {
+		return nil, err
+	}
+	if r.positionSpecifiers.isFrac {
+		return &PositionPattern{
+			positionPattern: trace.NewSpanFractionPositionPattern(r.positionSpecifiers.percentage/100.0, r.positionSpecifiers.multiplePositionPolicy),
+			spanPattern:     spanPattern,
+		}, nil
+	}
+	positionPattern, err := trace.NewSpanMarkPositionPattern(r.positionSpecifiers.markRE, r.positionSpecifiers.multiplePositionPolicy)
+	if err != nil {
+		return nil, err
+	}
+	return &PositionPattern{
+		positionPattern: positionPattern,
+		spanPattern:     spanPattern,
+	}, nil
 }
 
 // MustParsePositionSpecifiers works as ParsePositionSpecifiers, except that it
@@ -421,7 +511,7 @@ func ParseSpecifiers(
 		pp, err := buildPositionPattern(ht, r.positionSpecifiers)
 		return nil, pp, err
 	case spanSpecifiersType:
-		sp, err := buildSpanPattern(ht, r.spanSpecifiers)
+		sp, err := buildSpawningSpanFinderPattern(ht, r.spawningSpanSpecifier)
 		return sp, nil, err
 	default:
 		return nil, nil, fmt.Errorf("can't interpret specifier '%s' as a span or position pattern", specifierStr)

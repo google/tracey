@@ -7,6 +7,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qq
 golang.org/x/exp v0.0.0-20181106170214-d68db9428509/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
 golang.org/x/tools v0.38.0 h1:Hx2Xv8hISq8Lm16jvBZ2VQf+RLmbd7wVUsALibYI/IQ=
 golang.org/x/tools v0.38.0/go.mod h1:yEsQ/d/YK8cjh0L6rZlY8tgtlKiBNTL14pGDJPJpYQs=
+golang.org/x/tools v0.39.0 h1:ik4ho21kwuQln40uelmciQPp9SipgNDdrafrYA4TmQQ=
+golang.org/x/tools v0.39.0/go.mod h1:JnefbkDPyD8UU2kI5fuf8ZX4/yUeh9W877ZeBONxUqQ=
 modernc.org/golex v1.1.0 h1:dmSaksHMd+y6NkBsRsCShNPRaSNCNH+abrVm5/gZic8=
 modernc.org/golex v1.1.0/go.mod h1:2pVlfqApurXhR1m0N+WDYu6Twnc4QuvO4+U8HnwoiRA=
 modernc.org/goyacc v1.0.3 h1:THB30acflQVO110y2dUKZkIzSCBXyebDDcUiGb0CJEY=

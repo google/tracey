@@ -19,6 +19,7 @@
   import (
     "fmt"
     "strconv"
+    "strings"
 
     "github.com/google/tracey/trace"
     "github.com/google/tracey/trace/parser/lexer"
@@ -41,6 +42,21 @@
     globstar
   )
 
+  func (pet pathElementType) String() string {
+    switch pet {
+      case literal:
+        return "literal"
+      case regex:
+        return "regex"
+      case star:
+        return "star"
+      case globstar:
+        return "globstar"
+      default:
+        return "<unknown>"
+    }
+  }
+
   type pathElement struct {
     t pathElementType
     str string
@@ -51,9 +67,74 @@
     spanMatchers []*pathElement
   }
 
+  func pathStr(path []*pathElement) string {
+    ret := make([]string, len(path))
+    for idx, pe := range path {
+      ret[idx] = pe.String()
+    }
+    return strings.Join(ret, "/")
+  }
+
+  func (ss *spanSpecifier) String() string {
+    var ret []string
+    if len(ss.categoryMatchers) > 0 {
+      ret = append(ret, fmt.Sprintf("cats %s", pathStr(ss.categoryMatchers)))
+    }
+    if len(ss.spanMatchers) > 0 {
+      ret = append(ret, fmt.Sprintf("spans %s", pathStr(ss.spanMatchers)))
+    }
+    return strings.Join(ret, ", ")
+  }
+
   type spanSpecifiers struct {
     spanSpecifiers []*spanSpecifier
+  }
+
+  func (ss *spanSpecifiers) String() string {
+    ret := make([]string, len(ss.spanSpecifiers))
+    for idx, ss := range ss.spanSpecifiers {
+      ret[idx] = ss.String()
+    }
+    return strings.Join(ret, "; ")
+  }
+
+  type spawningPathElement struct {
+    spanSpecifiers *spanSpecifiers
+    directChild bool
+  }
+
+  func (spe *spawningPathElement) String() string {
+    var ret string
+    if spe.directChild {
+      ret = "(directly spawned) "
+    } else {
+      ret = "(indirectly spawned) "
+    }
+    return ret + spe.spanSpecifiers.String()
+  }
+
+  type spawningSpanSpecifier struct {
+    spawningPathElements []*spawningPathElement
     predicate *predicate.Predicate
+  }
+
+  func (sss *spawningSpanSpecifier) String() string {
+    ret := make([]string, len(sss.spawningPathElements))
+    for idx, spe := range sss.spawningPathElements {
+      ret[idx] = spe.String()
+    }
+    return strings.Join(ret, " | ")
+  }
+
+  func newSpawningSpanSpecifiers(spawningPathElements ...*spawningPathElement) *spawningSpanSpecifier {
+    return &spawningSpanSpecifier{
+      spawningPathElements: spawningPathElements,
+    }
+  }
+
+  func (sss *spawningSpanSpecifier) appendElement(spawningPathElement *spawningPathElement) *spawningSpanSpecifier {
+    sss.spawningPathElements = append(sss.spawningPathElements, spawningPathElement)
+    return sss
   }
 
   func newSpanSpecifiers(spanSpecifierSlice ...*spanSpecifier) *spanSpecifiers {
@@ -63,14 +144,14 @@
   }
 
   type positionSpecifiers struct {
-    spanSpecifiers *spanSpecifiers
+    spawningSpanSpecifier *spawningSpanSpecifier
     isFrac bool
     percentage float64
     markRE string
     multiplePositionPolicy trace.MultiplePositionPolicy
   }
 
-  func setSpanSpecifiers(l yyLexer, spanSpecifiers *spanSpecifiers) {
+  func setSpanSpecifiers(l yyLexer, spawningSpanSpecifier *spawningSpanSpecifier) {
     ll, ok := l.(*lexer.Lexer[*result, *yySymType])
     if !ok {
       l.Error(fmt.Sprintf("unexpected lexer type %T", l))
@@ -78,7 +159,7 @@
     }
     ll.Results = &result{
       resultType: spanSpecifiersType,
-      spanSpecifiers: spanSpecifiers,
+      spawningSpanSpecifier: spawningSpanSpecifier,
     }
   }
 
@@ -97,6 +178,7 @@
 
 // yySymType
 %union{
+  spawningSpanSpecifier *spawningSpanSpecifier
   spanSpecifiers *spanSpecifiers
   predicate *predicate.Predicate
   metricType predicate.MetricType
@@ -111,7 +193,8 @@
   multiplePositionPolicy trace.MultiplePositionPolicy
 }
 
-%type <spanSpecifiers> span_specifiers predicated_span_specifiers
+%type <spawningSpanSpecifier> spawning_span_specifier predicated_span_specifier
+%type <spanSpecifiers> span_specifiers
 %type <predicate> predicate
 %type <metricType> metric
 %type <comparisonOperator> comparison_operator
@@ -129,7 +212,7 @@
 %token <str> STR
 
 %nonassoc AT GT GTE LT LTE EQ NEQ AND OR SLASH PCT LPAREN RPAREN
-%nonassoc COMMA STAR GLOBSTAR
+%nonassoc COMMA STAR GLOBSTAR DIRECTLY_SPAWNING INDIRECTLY_SPAWNING
 %nonassoc STR ALL ANY LATEST EARLIEST DURATION WHERE
 %nonassoc TOTAL_DURATION SUSPENDED_DURATION SELF_UNSUSPENDED_DURATION TOTAL_UNSUSPENDED_DURATION
 
@@ -137,8 +220,8 @@
 
 %%
 
-start : predicated_span_specifiers                   { setSpanSpecifiers(yylex, $1) }
-      | LPAREN predicated_span_specifiers RPAREN     { setSpanSpecifiers(yylex, $2) }
+start : predicated_span_specifier                   { setSpanSpecifiers(yylex, $1) }
+      | LPAREN predicated_span_specifier RPAREN     { setSpanSpecifiers(yylex, $2) }
       | position_specifiers               { setPositionSpecifiers(yylex, $1) }
       | LPAREN position_specifiers RPAREN { setPositionSpecifiers(yylex, $2) }
       ;
@@ -146,10 +229,10 @@ start : predicated_span_specifiers                   { setSpanSpecifiers(yylex, 
 position_specifiers : span_frac_position_specifiers { $$ = $1 }
                     | mark_re_position_specifiers   { $$ = $1 }
 
-span_frac_position_specifiers : predicated_span_specifiers AT percentage multiple_position_policy { $$ = &positionSpecifiers{$1, true, $3, "", $4} }
+span_frac_position_specifiers : predicated_span_specifier AT percentage multiple_position_policy { $$ = &positionSpecifiers{$1, true, $3, "", $4} }
                               ;
 
-mark_re_position_specifiers : predicated_span_specifiers AT LPAREN string_literal RPAREN multiple_position_policy { $$ = &positionSpecifiers{$1, false, 0, $4, $6} }
+mark_re_position_specifiers : predicated_span_specifier AT LPAREN string_literal RPAREN multiple_position_policy { $$ = &positionSpecifiers{$1, false, 0, $4, $6} }
                             ;
 
 multiple_position_policy : EARLIEST { $$ = trace.EarliestMatchingPosition }
@@ -160,9 +243,9 @@ multiple_position_policy : EARLIEST { $$ = trace.EarliestMatchingPosition }
 percentage : STR PCT { $$ = expectFloat(yylex, $<str>1) }
            ;
 
-predicated_span_specifiers : span_specifiers                 { $$ = $1 }
-                           | span_specifiers WHERE predicate { $1.predicate = $3; $$ = $1 }
-                           ;
+predicated_span_specifier : spawning_span_specifier                 { $$ = $1 }
+                          | spawning_span_specifier WHERE predicate { $1.predicate = $3; $$ = $1 }
+                          ;
 
 predicate : metric comparison_operator comparand { $$ = predicate.NewComparatorPredicate($1, $2, $3) }
           | predicate AND predicate              { $$ = predicate.NewLogicalPredicate($1, predicate.And, $3) }
@@ -186,6 +269,14 @@ comparison_operator : EQ  { $$ = predicate.Equal }
 
 comparand : DURATION LPAREN STR RPAREN { $$ = predicate.Duration($3) }
           ;
+
+spawning_span_specifier : span_specifiers
+                           { $$ = newSpawningSpanSpecifiers(&spawningPathElement{$1, true}) }
+                         | spawning_span_specifier DIRECTLY_SPAWNING span_specifiers
+                           { $$ = $1.appendElement(&spawningPathElement{$3, true}) }
+                         | spawning_span_specifier INDIRECTLY_SPAWNING span_specifiers
+                           { $$ = $1.appendElement(&spawningPathElement{$3, false}) }
+                         ;
 
 span_specifiers : ALL                                  { $$ = newSpanSpecifiers(&spanSpecifier{nil, []*pathElement{&pathElement{globstar, ""}}}) }
                 | ANY                                  { $$ = newSpanSpecifiers(&spanSpecifier{nil, []*pathElement{&pathElement{globstar, ""}}}) }

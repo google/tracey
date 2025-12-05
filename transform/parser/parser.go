@@ -111,6 +111,11 @@ func consumeParenthesizedString(input string, lvalue *yySymType) (ok bool, token
 		if c == 0 {
 			return false, 0, 0, errors.New("unescaped, unbalanced parens in string")
 		}
+		if escaped && r != ')' && r != '(' {
+			// Only escape parens within this string.  A \ before a non-paren is just
+			// a \.
+			str += `\`
+		}
 		if openParens == 0 && !escaped && r == ')' {
 			str += string(r)
 			lvalue.str = str

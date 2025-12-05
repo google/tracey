@@ -900,8 +900,8 @@ Trace spans:
 			return originalTrace, err
 		},
 		transformationTemplate: `
-scale spans(a launcher) by 2.0;
-scale spans(b launcher) by .5;`,
+scale spans(a\ launcher) by 2.0;
+scale spans(b\ launcher) by .5;`,
 		hierarchyType: testtrace.None,
 		wantTraceStr: `
 Trace spans:

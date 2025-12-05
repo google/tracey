@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/tracey/spawning"
 	testtrace "github.com/google/tracey/test_trace"
 	"github.com/google/tracey/trace"
 	"github.com/google/tracey/trace/parser/lexer"
@@ -86,99 +87,8 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
-func TestPathElementParsing(t *testing.T) {
-	tr := testtrace.NewTestingTraceBuilder(t).
-		WithRootCategories(
-			testtrace.RootCategory(testtrace.Structural, "cat"),
-		).
-		WithRootSpans(
-			testtrace.RootSpan(0, 100, "a",
-				testtrace.ParentCategories(testtrace.FindCategory(testtrace.Structural, "cat")),
-				testtrace.Span(10, 40, "b",
-					testtrace.Span(20, 30, "c",
-						testtrace.Span(22, 24, "e"),
-						testtrace.Span(26, 28, "/"),
-					),
-				),
-				testtrace.Span(60, 90, "d",
-					testtrace.Span(65, 75, "c"),
-					testtrace.Span(77, 85, "c"),
-				),
-			),
-		).Build()
-	for _, test := range []struct {
-		description           string
-		pathMatchersStr       string
-		wantSelectedSpanPaths string
-	}{{
-		description:           "all cs",
-		pathMatchersStr:       "**/c",
-		wantSelectedSpanPaths: "a/b/c, a/d/c, a/d/c",
-	}, {
-		description:           "all cs another way",
-		pathMatchersStr:       "*/*/c",
-		wantSelectedSpanPaths: "a/b/c, a/d/c, a/d/c",
-	}, {
-		description:           "everything at or under a/d",
-		pathMatchersStr:       "a/d/**",
-		wantSelectedSpanPaths: "a/d, a/d/c, a/d/c",
-	}, {
-		description:           "everything at or under a/d",
-		pathMatchersStr:       "a/d/**",
-		wantSelectedSpanPaths: "a/d, a/d/c, a/d/c",
-	}, {
-		description:           "all spans whose name is a vowel",
-		pathMatchersStr:       "**/([aeiou])",
-		wantSelectedSpanPaths: "a, a/b/c/e",
-	}, {
-		description:           "everything just under a",
-		pathMatchersStr:       "a/*",
-		wantSelectedSpanPaths: "a/b, a/d",
-	}, {
-		description:           "multiple selectors",
-		pathMatchersStr:       `a/b/c,a/d/c`,
-		wantSelectedSpanPaths: `a/b/c, a/d/c, a/d/c`,
-	}, {
-		description:           "did you really name that span '/'?",
-		pathMatchersStr:       `**/\/`,
-		wantSelectedSpanPaths: `a/b/c//`,
-	}, {
-		description:           "fragment with initial 'at' is ok",
-		pathMatchersStr:       `**/attribute`,
-		wantSelectedSpanPaths: ``,
-	}} {
-		t.Run(test.description, func(t *testing.T) {
-			spanPattern, err := ParseSpanSpecifierPatterns(0, test.pathMatchersStr)
-			if err != nil {
-				t.Fatalf("failed to parse path matchers string: %s", err)
-			}
-			sfp, err := NewSpanFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](spanPattern, tr)
-			if err != nil {
-				t.Fatalf("failed to build SpanFinder: %s", err)
-			}
-			spans := trace.SelectSpans(sfp)
-			var spanPaths []string
-			for _, span := range spans.Spans() {
-				spanPaths = append(
-					spanPaths,
-					strings.Join(
-						trace.GetSpanDisplayPath[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](
-							span, testtrace.TestNamer,
-						),
-						"/"),
-				)
-			}
-			sort.Strings(spanPaths)
-			gotSelectedSpanPaths := strings.Join(spanPaths, ", ")
-			if gotSelectedSpanPaths != test.wantSelectedSpanPaths {
-				t.Errorf("Got span paths '%s', wanted '%s'", gotSelectedSpanPaths, test.wantSelectedSpanPaths)
-			}
-		})
-	}
-}
-
 func TestSpanFinderParsing(t *testing.T) {
-	tr := testtrace.NewTestingTraceBuilder(t).
+	tr1 := testtrace.NewTestingTraceBuilder(t).
 		WithRootCategories(
 			testtrace.RootCategory(testtrace.Structural, "process 1",
 				testtrace.Category("thread 1"),
@@ -201,6 +111,25 @@ func TestSpanFinderParsing(t *testing.T) {
 				testtrace.Span(80, 100, "child"),
 			),
 		).Build()
+	tr2 := testtrace.NewTestingTraceBuilder(t).
+		WithRootCategories(
+			testtrace.RootCategory(testtrace.Structural, "cat"),
+		).
+		WithRootSpans(
+			testtrace.RootSpan(0, 100, "a",
+				testtrace.ParentCategories(testtrace.FindCategory(testtrace.Structural, "cat")),
+				testtrace.Span(10, 40, "b",
+					testtrace.Span(20, 30, "c",
+						testtrace.Span(22, 24, "e"),
+						testtrace.Span(26, 28, "/"),
+					),
+				),
+				testtrace.Span(60, 90, "d",
+					testtrace.Span(65, 75, "c"),
+					testtrace.Span(77, 85, "c"),
+				),
+			),
+		).Build()
 	trace1, err := testtrace.Trace1()
 	if err != nil {
 		t.Fatalf("failed to build Trace1: %v", err)
@@ -210,35 +139,36 @@ func TestSpanFinderParsing(t *testing.T) {
 		tr                    trace.Trace[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]
 		spanFinderStr         string
 		hierarchyType         trace.HierarchyType
+		spanFinderOpts        []SpanFinderOption[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]
 		wantSelectedSpanPaths string
 	}{{
 		description:           "** > root, structural hierarchy",
-		tr:                    tr,
+		tr:                    tr1,
 		spanFinderStr:         "** > root",
 		hierarchyType:         testtrace.Structural,
 		wantSelectedSpanPaths: "process 1 > root, process 1/thread 1 > root",
 	}, {
 		description:           "** > root, causal hierarchy",
-		tr:                    tr,
+		tr:                    tr1,
 		spanFinderStr:         "** > root",
 		hierarchyType:         testtrace.Causal,
 		wantSelectedSpanPaths: "cpu 1 > root, cpu 2 > root",
 	}, {
 		description:           "** > **, causal hierarchy",
-		tr:                    tr,
+		tr:                    tr1,
 		spanFinderStr:         "** > **",
 		hierarchyType:         testtrace.Causal,
 		wantSelectedSpanPaths: "cpu 1 > root, cpu 2 > root, cpu 2 > root/child",
 	}, {
 		description:           "process 1 > root, structural hierarchy",
-		tr:                    tr,
-		spanFinderStr:         "process 1 > root",
+		tr:                    tr1,
+		spanFinderStr:         `process\ 1 > root`,
 		hierarchyType:         testtrace.Structural,
 		wantSelectedSpanPaths: "process 1 > root",
 	}, {
 		description:           "process 1 > root, structural hierarchy, quoted",
-		tr:                    tr,
-		spanFinderStr:         "'process 1' > root",
+		tr:                    tr1,
+		spanFinderStr:         `'process\ 1' > root`,
 		hierarchyType:         testtrace.Structural,
 		wantSelectedSpanPaths: "process 1 > root",
 	}, {
@@ -253,13 +183,83 @@ func TestSpanFinderParsing(t *testing.T) {
 		spanFinderStr:         "** where self_unsuspended_duration >= duration(30ns)",
 		hierarchyType:         testtrace.Causal,
 		wantSelectedSpanPaths: "p0/t0.0/r0.0.0 > s0.0.0/0, p0/t0.0/t0.1/r0.1.0 > s0.1.0",
+	}, {
+		description:   "trace1, all spans spawned at least one level under s0.0.0",
+		tr:            trace1,
+		spanFinderStr: "s0.0.0/** -> **",
+		hierarchyType: testtrace.Causal,
+		spanFinderOpts: []SpanFinderOption[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload]{
+			SpawningForestFetcher(
+				func() (*spawning.Forest[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload], error) {
+					return spawning.NewSpawningForest(
+						trace1,
+						spawning.Dependency(testtrace.Spawn, spawning.MustBeFirstIncomingDependency),
+					)
+				},
+			),
+		},
+		wantSelectedSpanPaths: "p0/p1/t1.0/r1.0.0 > s1.0.0, p0/t0.0/t0.1/r0.1.0 > s0.1.0",
+	}, {
+		description:           "all cs",
+		tr:                    tr2,
+		spanFinderStr:         "**/c",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a/b/c, a/d/c, a/d/c",
+	}, {
+		description:           "all cs another way",
+		tr:                    tr2,
+		spanFinderStr:         "*/*/c",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a/b/c, a/d/c, a/d/c",
+	}, {
+		description:           "everything at or under a/d",
+		tr:                    tr2,
+		spanFinderStr:         "a/d/**",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a/d, a/d/c, a/d/c",
+	}, {
+		description:           "everything at or under a/d",
+		tr:                    tr2,
+		spanFinderStr:         "a/d/**",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a/d, a/d/c, a/d/c",
+	}, {
+		description:           "all spans whose name is a vowel",
+		tr:                    tr2,
+		spanFinderStr:         "**/([aeiou])",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a, a/b/c/e",
+	}, {
+		description:           "everything just under a",
+		tr:                    tr2,
+		spanFinderStr:         "a/*",
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: "a/b, a/d",
+	}, {
+		description:           "multiple selectors",
+		tr:                    tr2,
+		spanFinderStr:         `a/b/c,a/d/c`,
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: `a/b/c, a/d/c, a/d/c`,
+	}, {
+		description:           "did you really name that span '/'?",
+		tr:                    tr2,
+		spanFinderStr:         `**/\/`,
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: `a/b/c//`,
+	}, {
+		description:           "fragment with initial 'at' is ok",
+		tr:                    tr2,
+		spanFinderStr:         `**/attribute`,
+		hierarchyType:         trace.SpanOnlyHierarchyType,
+		wantSelectedSpanPaths: ``,
 	}} {
 		t.Run(test.description, func(t *testing.T) {
 			sfps, err := ParseSpanSpecifierPatterns(test.hierarchyType, test.spanFinderStr)
 			if err != nil {
 				t.Fatalf("failed to parse path matchers string: %s", err)
 			}
-			sf, err := NewSpanFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](sfps, test.tr)
+			sf, err := NewSpanFinder(sfps, test.tr, test.spanFinderOpts...)
 			if err != nil {
 				t.Fatalf("failed to build span finder: %s", err)
 			}
@@ -267,20 +267,17 @@ func TestSpanFinderParsing(t *testing.T) {
 			var spanPaths []string
 			for _, span := range spans {
 				rootSpan := span.RootSpan()
-				thisPath := strings.Join(
-					trace.GetCategoryDisplayPath[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](
-						rootSpan.ParentCategory(test.hierarchyType),
-						testtrace.TestNamer,
-					),
-					"/",
-				)
-				thisPath += " > " + strings.Join(
-					trace.GetSpanDisplayPath[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](
-						span,
-						testtrace.TestNamer,
-					),
-					"/",
-				)
+				var thisPath string
+				if test.hierarchyType != trace.SpanOnlyHierarchyType {
+					thisPath = strings.Join(
+						trace.GetCategoryDisplayPath(
+							rootSpan.ParentCategory(test.hierarchyType),
+							testtrace.TestNamer,
+						),
+						"/",
+					) + " > "
+				}
+				thisPath += strings.Join(trace.GetSpanDisplayPath(span, testtrace.TestNamer), "/")
 				spanPaths = append(spanPaths, thisPath)
 			}
 			sort.Strings(spanPaths)
@@ -301,6 +298,7 @@ func TestTracePositionParsing(t *testing.T) {
 		description                      string
 		positionStr                      string
 		hierarchyType                    trace.HierarchyType
+		fetchSpawningForest              func() (*spawning.Forest[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload], error)
 		wantedSelectedElementarySpansStr string
 	}{{
 		description:                      "50% through 0 and 3 with @",
@@ -334,19 +332,13 @@ func TestTracePositionParsing(t *testing.T) {
 				t.Fatalf("Failed to parse position specifier: %s", err)
 			}
 			var gotSelectedElementarySpansStrs []string
-			pf, err := NewPositionFinder[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](pos, tr)
+			pf, err := NewPositionFinder(pos, tr, SpawningForestFetcher(test.fetchSpawningForest))
 			if err != nil {
 				t.Fatalf("Failed to build position finder: %s", err)
 			}
 			for _, esp := range pf.FindPositions() {
 				s := fmt.Sprintf("%s %v-%v",
-					strings.Join(
-						trace.GetSpanDisplayPath[time.Duration, testtrace.StringPayload, testtrace.StringPayload, testtrace.StringPayload](
-							esp.ElementarySpan.Span(),
-							testtrace.TestNamer,
-						),
-						"/",
-					),
+					strings.Join(trace.GetSpanDisplayPath(esp.ElementarySpan.Span(), testtrace.TestNamer), "/"),
 					esp.ElementarySpan.Start(), esp.ElementarySpan.End(),
 				)
 				gotSelectedElementarySpansStrs = append(gotSelectedElementarySpansStrs, s)
